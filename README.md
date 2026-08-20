@@ -127,3 +127,7 @@ has been given reference images for.
 - The admin dialog has no authentication of its own; it assumes a trusted
   operator on a trusted machine.
 - Tested on Windows with a local MySQL instance.
+
+## License
+
+[MIT](LICENSE)
