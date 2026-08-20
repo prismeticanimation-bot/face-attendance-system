@@ -1230,7 +1230,7 @@ class AttendanceSystemGUI(QMainWindow):
         self.stop_btn = None
         self.admin_btn = None
 
-        self.db_helper = DatabaseHelper(host="localhost", user="root", password="1234", database="attend")
+        self.db_helper = DatabaseHelper()
         if not self.db_helper.connect():
             msg = QMessageBox(self)
             msg.setWindowTitle("Error")

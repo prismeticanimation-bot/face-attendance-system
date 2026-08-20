@@ -1,3 +1,5 @@
+import os
+
 import mysql.connector
 from mysql.connector import Error
 import cv2
@@ -8,7 +10,13 @@ from datetime import datetime, date
 class DatabaseHelper:
 
 
-    def __init__(self, host='localhost', user='root', password='1234', database='attend'):
+    def __init__(self, host=None, user=None, password=None, database=None):
+        # Credentials come from the environment so they are not baked into
+        # the source; the previous hard-coded values remain the defaults.
+        host = host if host is not None else os.environ.get('ATTENDANCE_DB_HOST', 'localhost')
+        user = user if user is not None else os.environ.get('ATTENDANCE_DB_USER', 'root')
+        password = password if password is not None else os.environ.get('ATTENDANCE_DB_PASSWORD', '1234')
+        database = database if database is not None else os.environ.get('ATTENDANCE_DB_NAME', 'attend')
 
         self.host = host
         self.user = user
