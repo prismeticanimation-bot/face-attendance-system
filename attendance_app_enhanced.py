@@ -1750,8 +1750,11 @@ class AttendanceSystemGUI(QMainWindow):
         layout.addWidget(date_label)
 
         table = QTableWidget()
-        table.setColumnCount(5)
-        table.setHorizontalHeaderLabels(["Employee ID", "Name", "Arrival Time", "Status", "Select"])
+        table.setColumnCount(7)
+        table.setHorizontalHeaderLabels([
+            "Employee ID", "Name", "Check-in", "Check-out",
+            "Working Duration", "Status", "Select"
+        ])
         table.setStyleSheet(f"""
             QTableWidget {{
                 background-color: {DARK_SECONDARY};
@@ -1769,11 +1772,9 @@ class AttendanceSystemGUI(QMainWindow):
             }}
         """)
         table.horizontalHeader().setStretchLastSection(True)
-        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
-        table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        for column in range(6):
+            table.horizontalHeader().setSectionResizeMode(column, QHeaderView.Stretch)
+        table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
 
         self.current_table = table
         self.populate_table_data(table)
@@ -1859,128 +1860,48 @@ class AttendanceSystemGUI(QMainWindow):
         self.admin_dialog.exec_()
 
     def populate_table_data(self, table):
-        today = date.today()
-        employees = self.db_helper.get_all_employees()
+        records = self.db_helper.get_daily_attendance(date.today())
+        self._populate_attendance_rows(table, records)
 
-        rows = []
-        for emp in employees:
-            try:
-                cursor = self.db_helper.connection.cursor()
-                cursor.execute("""SELECT arrival_time FROM attendance 
-                               WHERE employee_id = %s AND attendance_date = %s""", 
-                             (emp['employee_id'], today))
-                result = cursor.fetchone()
-                cursor.close()
-
-                if not self.is_deadline_passed():
-                    if result:
-                        rows.append((emp['employee_id'], emp['employee_name'], str(result[0]), "Present"))
-                else:
-                    if result:
-                        rows.append((emp['employee_id'], emp['employee_name'], str(result[0]), "Present"))
-                    else:
-                        rows.append((emp['employee_id'], emp['employee_name'], "-", "Absent"))
-            except:
-                pass
-
-        table.setRowCount(len(rows))
-
-        for row, (emp_id, emp_name, time_str, status) in enumerate(rows):
-            table.setItem(row, 0, QTableWidgetItem(emp_id))
-            table.setItem(row, 1, QTableWidgetItem(emp_name))
-            table.setItem(row, 2, QTableWidgetItem(time_str))
-
-            status_item = QTableWidgetItem(status)
-            if status == "Present":
-                status_item.setBackground(QColor(49, 162, 76))
-            else:
-                status_item.setBackground(QColor(228, 22, 58))
-            table.setItem(row, 3, status_item)
-
+    def _populate_attendance_rows(self, table, records):
+        table.setRowCount(len(records))
+        for row, record in enumerate(records):
+            values = [
+                record['employee_id'], record['employee_name'],
+                record['arrival_time'], record['departure_time'],
+                record['working_duration'], record['status']
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                if column == 5:
+                    if value == "PRESENT":
+                        item.setBackground(QColor(49, 162, 76))
+                    elif value == "LATE":
+                        item.setBackground(QColor(245, 124, 0))
+                    elif value == "ABSENT":
+                        item.setBackground(QColor(228, 22, 58))
+                table.setItem(row, column, item)
             checkbox = QCheckBox()
-            checkbox.setProperty("employee_id", emp_id)
-            table.setCellWidget(row, 4, checkbox)
+            checkbox.setProperty("employee_id", record['employee_id'])
+            table.setCellWidget(row, 6, checkbox)
 
     def update_admin_stats(self, table, present_label, absent_label):
-        today = date.today()
-        employees = self.db_helper.get_all_employees()
-
-        present_count = 0
-        absent_count = 0
-
-        for emp in employees:
-            try:
-                cursor = self.db_helper.connection.cursor()
-                cursor.execute("""SELECT arrival_time FROM attendance 
-                               WHERE employee_id = %s AND attendance_date = %s""", 
-                             (emp['employee_id'], today))
-                result = cursor.fetchone()
-                cursor.close()
-
-                if result:
-                    present_count += 1
-                else:
-                    if self.is_deadline_passed():
-                        absent_count += 1
-            except:
-                pass
-
+        records = self.db_helper.get_daily_attendance(date.today())
+        present_count = sum(1 for row in records if row['status'] in ("PRESENT", "LATE"))
+        absent_count = sum(1 for row in records if row['status'] == "ABSENT")
         present_label.setText(f"Present: {present_count}")
-        if self.is_deadline_passed():
-            absent_label.setText(f"Absent: {absent_count}")
-        else:
-            absent_label.setText(f"Absent: 0")
+        absent_label.setText(f"Absent: {absent_count}")
 
     def search_attendance_records(self, table, search_input):
         search_text = search_input.text().lower().strip()
-        if not search_text:
-            self.populate_table_data(table)
-            return
-
-        today = date.today()
-        employees = self.db_helper.get_all_employees()
-
-        rows = []
-        for emp in employees:
-            if search_text not in emp['employee_name'].lower() and search_text not in emp['employee_id'].lower():
-                continue
-
-            try:
-                cursor = self.db_helper.connection.cursor()
-                cursor.execute("""SELECT arrival_time FROM attendance 
-                               WHERE employee_id = %s AND attendance_date = %s""", 
-                             (emp['employee_id'], today))
-                result = cursor.fetchone()
-                cursor.close()
-
-                if not self.is_deadline_passed():
-                    if result:
-                        rows.append((emp['employee_id'], emp['employee_name'], str(result[0]), "Present"))
-                else:
-                    if result:
-                        rows.append((emp['employee_id'], emp['employee_name'], str(result[0]), "Present"))
-                    else:
-                        rows.append((emp['employee_id'], emp['employee_name'], "-", "Absent"))
-            except:
-                pass
-
-        table.setRowCount(len(rows))
-
-        for row, (emp_id, emp_name, time_str, status) in enumerate(rows):
-            table.setItem(row, 0, QTableWidgetItem(emp_id))
-            table.setItem(row, 1, QTableWidgetItem(emp_name))
-            table.setItem(row, 2, QTableWidgetItem(time_str))
-
-            status_item = QTableWidgetItem(status)
-            if status == "Present":
-                status_item.setBackground(QColor(49, 162, 76))
-            else:
-                status_item.setBackground(QColor(228, 22, 58))
-            table.setItem(row, 3, status_item)
-
-            checkbox = QCheckBox()
-            checkbox.setProperty("employee_id", emp_id)
-            table.setCellWidget(row, 4, checkbox)
+        records = self.db_helper.get_daily_attendance(date.today())
+        if search_text:
+            records = [
+                row for row in records
+                if search_text in row['employee_name'].lower()
+                or search_text in row['employee_id'].lower()
+            ]
+        self._populate_attendance_rows(table, records)
 
     def clear_search_attendance(self, table, search_input):
         search_input.clear()
@@ -2220,70 +2141,29 @@ class AttendanceSystemGUI(QMainWindow):
 
     def export_to_csv(self):
         file_path, _ = QFileDialog.getSaveFileName(
-            self.admin_dialog, "Save Report", f"attendance_{date.today()}.csv", "CSV Files (*.csv)"
+            self.admin_dialog, "Save Report",
+            f"attendance_{date.today()}.csv", "CSV Files (*.csv)"
         )
-
         if not file_path:
             return
-
         try:
-            employees = self.db_helper.get_all_employees()
-            today = date.today()
-
+            records = self.db_helper.get_daily_attendance(date.today())
             with open(file_path, 'w', newline='', encoding='utf-8-sig') as f:
                 writer = csv.writer(f)
-                writer.writerow(["Employee ID", "Name", "Arrival Time", "Status"])
-
-                for emp in employees:
-                    try:
-                        cursor = self.db_helper.connection.cursor()
-                        cursor.execute("""SELECT arrival_time FROM attendance 
-                                       WHERE employee_id = %s AND attendance_date = %s""", 
-                                     (emp['employee_id'], today))
-                        result = cursor.fetchone()
-                        cursor.close()
-
-                        if result:
-                            writer.writerow([emp['employee_id'], emp['employee_name'], str(result[0]), "Present"])
-                        else:
-                            if self.is_deadline_passed():
-                                writer.writerow([emp['employee_id'], emp['employee_name'], "-", "Absent"])
-                    except:
-                        pass
-
-            msg = QMessageBox(self.admin_dialog)
-            msg.setWindowTitle("Success")
-            msg.setText("Report exported successfully!")
-            msg.setStyleSheet(f"""
-                QMessageBox {{ background-color: {DARK_BG}; }}
-                QMessageBox QLabel {{ color: {TEXT_PRIMARY}; }}
-                QPushButton {{ 
-                    color: {TEXT_PRIMARY}; 
-                    background-color: {ACCENT_BLUE};
-                    border: none;
-                    border-radius: 3px;
-                    padding: 5px;
-                    min-width: 50px;
-                }}
-            """)
-            msg.exec_()
+                writer.writerow([
+                    "Employee ID", "Name", "Check-in", "Check-out",
+                    "Working Duration", "Status"
+                ])
+                for record in records:
+                    writer.writerow([
+                        record['employee_id'], record['employee_name'],
+                        record['arrival_time'], record['departure_time'],
+                        record['working_duration'], record['status']
+                    ])
+            QMessageBox.information(self.admin_dialog, "Success",
+                                    "Attendance report exported successfully.")
         except Exception as e:
-            msg = QMessageBox(self.admin_dialog)
-            msg.setWindowTitle("Error")
-            msg.setText(str(e))
-            msg.setStyleSheet(f"""
-                QMessageBox {{ background-color: {DARK_BG}; }}
-                QMessageBox QLabel {{ color: {TEXT_PRIMARY}; }}
-                QPushButton {{ 
-                    color: {TEXT_PRIMARY}; 
-                    background-color: {ACCENT_BLUE};
-                    border: none;
-                    border-radius: 3px;
-                    padding: 5px;
-                    min-width: 50px;
-                }}
-            """)
-            msg.exec_()
+            QMessageBox.critical(self.admin_dialog, "Export Error", str(e))
 
     def closeEvent(self, event):
         if self.camera_thread:
