@@ -120,37 +120,40 @@ class InsightFaceCameraThread(QThread):
     frame_ready = pyqtSignal(object)
     face_recognized = pyqtSignal(str, str, float, dict)
 
-    def __init__(self, extractor, embeddings_data, daily_records):
+    def __init__(self, extractor, embeddings_data, mode="checkin", eligible_ids=None):
         super().__init__()
         self.extractor = extractor
         self.embeddings_data = embeddings_data
+        self.mode = mode
+        self.eligible_ids = set(eligible_ids) if eligible_ids is not None else None
         self.running = False
         self.camera = None
-        self.daily_records = daily_records
+        self.emitted_ids = set()
 
     def run(self):
-        # self.camera = cv2.VideoCapture(0)
         self.camera = cv2.VideoCapture(0, cv2.CAP_MSMF)
-
         self.running = True
-
+        if not self.camera.isOpened():
+            self.running = False
+            self.frame_ready.emit(None)
+            return
         while self.running:
             ret, frame = self.camera.read()
-            if ret:
-                employee_id, similarity, employee_name, face_info = self.extractor.recognize_face_from_embedding(
-                    frame, self.embeddings_data
-                )
-
-                if employee_id and similarity > self.extractor.threshold:
-                    if employee_id not in self.daily_records:
-                        self.face_recognized.emit(employee_id, employee_name, float(similarity), 
-                                                 face_info if face_info else {})
-                        self.daily_records[employee_id] = datetime.now()
-
-                self.frame_ready.emit(frame)
-
+            if not ret:
+                continue
+            employee_id, similarity, employee_name, face_info = (
+                self.extractor.recognize_face_from_embedding(frame, self.embeddings_data)
+            )
+            if employee_id and similarity > self.extractor.threshold:
+                allowed = self.eligible_ids is None or employee_id in self.eligible_ids
+                if allowed and employee_id not in self.emitted_ids:
+                    self.emitted_ids.add(employee_id)
+                    self.face_recognized.emit(employee_id, employee_name, float(similarity),
+                                               face_info if face_info else {})
+            self.frame_ready.emit(frame)
         if self.camera:
             self.camera.release()
+            self.camera = None
 
     def stop(self):
         self.running = False
@@ -1273,8 +1276,14 @@ class AttendanceSystemGUI(QMainWindow):
         self.session_daily_records = {}
         self.camera_thread = None
         self.status_timer = None
-        self.deadline_time = time(12, 0)
-        self.deadline_set = False
+        self.schedule = self.db_helper.get_attendance_schedule()
+        self.checkin_time = datetime.strptime(self.schedule['checkin_time'], '%H:%M:%S').time()
+        self.checkin_cutoff = datetime.strptime(self.schedule['checkin_cutoff'], '%H:%M:%S').time()
+        self.checkout_start = datetime.strptime(self.schedule['checkout_start'], '%H:%M:%S').time()
+        self.camera_mode = None
+        self.checkout_auto_started_date = None
+        self.deadline_time = self.checkin_cutoff
+        self.deadline_set = True
         self.admin_dialog = None
         self.current_table = None
 
@@ -1416,46 +1425,37 @@ class AttendanceSystemGUI(QMainWindow):
         self.clock_timer.start(1000)
 
     def is_deadline_passed(self):
-        if not self.deadline_set:
-            return False
-        return datetime.now().time() >= self.deadline_time
+        return datetime.now().time() > self.checkin_cutoff
 
     def get_time_remaining(self):
-        if not self.deadline_set:
-            return "No deadline"
-
         now = datetime.now()
-        deadline_datetime = datetime.combine(now.date(), self.deadline_time)
-
-        if now > deadline_datetime:
-            deadline_datetime = datetime.combine(now.date() + timedelta(days=1), self.deadline_time)
-
-        remaining = deadline_datetime - now
-        hours = remaining.seconds // 3600
-        minutes = (remaining.seconds % 3600) // 60
-        seconds = remaining.seconds % 60
-
+        cutoff_dt = datetime.combine(now.date(), self.checkin_cutoff)
+        if now >= cutoff_dt:
+            return "Check-in closed"
+        remaining = cutoff_dt - now
+        hours, remainder = divmod(int(remaining.total_seconds()), 3600)
+        minutes, seconds = divmod(remainder, 60)
         return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
     def update_clock(self):
         now = datetime.now()
         self.clock_label.setText(f"{now.strftime('%H:%M:%S')} - {now.strftime('%d/%m/%Y')}")
-
-        if self.deadline_set:
-            if self.is_deadline_passed():
-                self.countdown_label.setText("Deadline: CLOSED")
-                self.countdown_label.setStyleSheet(f"color: {ERROR_RED}; font-weight: bold;")
-                if self.camera_thread and self.camera_thread.running:
-                    self.stop_recognition()
-            else:
-                self.countdown_label.setText(f"Time Remaining: {self.get_time_remaining()}")
-                self.countdown_label.setStyleSheet(f"color: {SUCCESS_GREEN};")
+        if now.time() <= self.checkin_cutoff:
+            self.countdown_label.setText(f"Check-in closes in: {self.get_time_remaining()}")
+            self.countdown_label.setStyleSheet(f"color: {SUCCESS_GREEN};")
         else:
-            self.countdown_label.setText("No deadline set")
+            self.countdown_label.setText("Check-in closed | Check-out starts at " +
+                                         self.checkout_start.strftime('%H:%M'))
             self.countdown_label.setStyleSheet(f"color: {WARNING_ORANGE};")
-
+        if self.camera_thread and self.camera_thread.running and self.camera_mode == "checkin":
+            if now.time() > self.checkin_cutoff:
+                self.stop_recognition()
+        if now.time() >= self.checkout_start and self.checkout_auto_started_date != now.date():
+            self.checkout_auto_started_date = now.date()
+            self.start_checkout_scan(silent=True)
         if now.second == 0:
             self.update_stats()
+
 
     def update_stats(self):
         # Check if UI elements are initialized
@@ -1492,70 +1492,40 @@ class AttendanceSystemGUI(QMainWindow):
             self.absent_label.setText(f"Absent: 0")
 
     def start_recognition(self):
-        if not self.deadline_set:
-            msg = QMessageBox(self)
-            msg.setWindowTitle("No Deadline")
-            msg.setText("Admin must set deadline first.")
-            msg.setStyleSheet(f"""
-                QMessageBox {{ background-color: {DARK_BG}; }}
-                QMessageBox QLabel {{ color: {TEXT_PRIMARY}; }}
-                QPushButton {{ 
-                    color: {TEXT_PRIMARY}; 
-                    background-color: {ACCENT_BLUE};
-                    border: none;
-                    border-radius: 3px;
-                    padding: 5px;
-                    min-width: 50px;
-                }}
-            """)
-            msg.exec_()
+        if datetime.now().time() > self.checkin_cutoff:
+            QMessageBox.information(self, "Check-in Closed",
+                "Check-in is closed after 9:30 AM. Evening check-out starts automatically at 6:00 PM.")
             return
+        self._start_camera_scan("checkin")
 
-        if self.is_deadline_passed():
-            msg = QMessageBox(self)
-            msg.setWindowTitle("Deadline Passed")
-            msg.setText("Cannot start - deadline passed.")
-            msg.setStyleSheet(f"""
-                QMessageBox {{ background-color: {DARK_BG}; }}
-                QMessageBox QLabel {{ color: {TEXT_PRIMARY}; }}
-                QPushButton {{ 
-                    color: {TEXT_PRIMARY}; 
-                    background-color: {ACCENT_BLUE};
-                    border: none;
-                    border-radius: 3px;
-                    padding: 5px;
-                    min-width: 50px;
-                }}
-            """)
-            msg.exec_()
+    def start_checkout_scan(self, silent=False):
+        pending_ids = self.db_helper.get_pending_checkouts(date.today())
+        if not pending_ids:
+            if not silent:
+                QMessageBox.information(self, "No Pending Check-outs",
+                                        "There are no employees waiting for check-out today.")
             return
+        if self.camera_thread and self.camera_thread.running:
+            if self.camera_mode == "checkout":
+                return
+            self.stop_recognition()
+        self._start_camera_scan("checkout", pending_ids=pending_ids)
 
-        self.session_daily_records = {}
-        employees = self.db_helper.get_all_employees()
-        today = date.today()
-
-        for emp in employees:
-            try:
-                cursor = self.db_helper.connection.cursor()
-                cursor.execute("""SELECT arrival_time FROM attendance 
-                               WHERE employee_id = %s AND attendance_date = %s""", 
-                             (emp['employee_id'], today))
-                result = cursor.fetchone()
-                cursor.close()
-                if result:
-                    self.session_daily_records[emp['employee_id']] = result[0]
-            except:
-                pass
-
-        self.camera_thread = InsightFaceCameraThread(self.extractor, self.embeddings_data, 
-                                                    self.session_daily_records)
+    def _start_camera_scan(self, mode, pending_ids=None):
+        if self.camera_thread and self.camera_thread.running:
+            return
+        self.camera_mode = mode
+        eligible = pending_ids if mode == "checkout" else None
+        self.camera_thread = InsightFaceCameraThread(
+            self.extractor, self.embeddings_data, mode=mode, eligible_ids=eligible
+        )
         self.camera_thread.frame_ready.connect(self.update_frame)
         self.camera_thread.face_recognized.connect(self.record_attendance)
         self.camera_thread.start()
-
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
-        self.recognition_label.setText("Recognizing faces...")
+        self.recognition_label.setText("Scanning for check-ins..." if mode == "checkin" else
+                                       f"Evening check-out scan active | {len(eligible or [])} pending")
         self.recognition_label.setStyleSheet(f"color: {SUCCESS_GREEN}; padding: 10px;")
 
     def stop_recognition(self):
@@ -1564,16 +1534,18 @@ class AttendanceSystemGUI(QMainWindow):
             self.camera_thread = None
 
         self.update_camera_icon()
-        self.start_btn.setEnabled(True if not self.is_deadline_passed() else False)
+        self.camera_mode = None
+        self.start_btn.setEnabled(datetime.now().time() <= self.checkin_cutoff)
         self.stop_btn.setEnabled(False)
         self.recognition_label.setText("Camera Stopped")
         self.recognition_label.setStyleSheet(f"color: {ERROR_RED}; padding: 10px;")
 
     def update_frame(self, frame):
-        if self.is_deadline_passed():
+        if frame is None:
+            self.recognition_label.setText("Camera could not be opened. Check camera connection.")
+            self.recognition_label.setStyleSheet(f"color: {ERROR_RED}; padding: 10px;")
             self.stop_recognition()
             return
-
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb_frame.shape
         bytes_per_line = ch * w
@@ -1583,19 +1555,50 @@ class AttendanceSystemGUI(QMainWindow):
         self.camera_label.setPixmap(scaled)
 
     def record_attendance(self, employee_id, employee_name, similarity, face_info):
-        print(f"Face recognized: {employee_name} ({employee_id}) with similarity: {similarity:.3f}")
-        
-        if self.db_helper.record_attendance(employee_id):
-            arrival_time = datetime.now().strftime("%H:%M:%S")
-            self.recognition_label.setText(f"✓ Check-in Registered\n{employee_name}\n{arrival_time}")
-            self.recognition_label.setStyleSheet(f"color: {SUCCESS_GREEN}; padding: 10px; font-weight: bold; font-size: 14px;")
+        print(f"Face recognized: {employee_name} ({employee_id}) similarity={similarity:.3f}")
+        if self.camera_mode == "checkout":
+            result = self.db_helper.record_check_out(employee_id)
+            if result.get('ok'):
+                message = (f"✓ Check-out Registered\n{employee_name}\n"
+                           f"{result['time']} | Working: {result['duration']}")
+            else:
+                message = f"Check-out not saved: {result.get('reason', 'unknown')}"
+                if result.get('reason') == 'no_checkin':
+                    message = f"No check-in found for {employee_name}"
+        else:
+            if datetime.now().time() > self.checkin_cutoff:
+                message = "Check-in closed after 9:30 AM"
+            else:
+                result = self.db_helper.record_check_in(employee_id)
+                if result.get('ok'):
+                    message = (f"✓ {result['status'].upper()} Check-in\n"
+                               f"{employee_name}\n{result['time']}")
+                else:
+                    message = {
+                        'checkin_closed': "Check-in closed after 9:30 AM",
+                        'already_checked_in': f"{employee_name} already checked in",
+                        'unknown_employee': "UNKNOWN PERSON / NOT REGISTERED"
+                    }.get(result.get('reason'), "Attendance could not be saved")
+        color = SUCCESS_GREEN if message.startswith("✓") else WARNING_ORANGE
+        self.recognition_label.setText(message)
+        self.recognition_label.setStyleSheet(
+            f"color: {color}; padding: 10px; font-weight: bold; font-size: 14px;"
+        )
+        if self.status_timer:
+            self.status_timer.stop()
+        self.status_timer = QTimer()
+        self.status_timer.timeout.connect(self.clear_recognition)
+        self.status_timer.start(4000)
+        self.update_stats()
+        if self.current_table:
+            self.populate_table_data(self.current_table)
+        if self.camera_mode == "checkout":
+            remaining = self.db_helper.get_pending_checkouts(date.today())
+            if not remaining:
+                self.stop_recognition()
+            elif self.camera_thread:
+                self.camera_thread.eligible_ids = set(remaining)
 
-            if self.status_timer:
-                self.status_timer.stop()
-            self.status_timer = QTimer()
-            self.status_timer.timeout.connect(self.clear_recognition)
-            self.status_timer.start(3000)
-            self.update_stats()
 
     def clear_recognition(self):
         self.recognition_label.setText("Recognizing faces...")
