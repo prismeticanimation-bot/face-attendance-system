@@ -119,6 +119,7 @@ class ImageViewerDialog(QDialog):
 class InsightFaceCameraThread(QThread):
     frame_ready = pyqtSignal(object)
     face_recognized = pyqtSignal(str, str, float, dict)
+    unknown_face = pyqtSignal()
 
     def __init__(self, extractor, embeddings_data, mode="checkin", eligible_ids=None):
         super().__init__()
@@ -129,6 +130,7 @@ class InsightFaceCameraThread(QThread):
         self.running = False
         self.camera = None
         self.emitted_ids = set()
+        self.unknown_notified = False
 
     def run(self):
         self.camera = cv2.VideoCapture(0, cv2.CAP_MSMF)
@@ -145,11 +147,17 @@ class InsightFaceCameraThread(QThread):
                 self.extractor.recognize_face_from_embedding(frame, self.embeddings_data)
             )
             if employee_id and similarity > self.extractor.threshold:
+                self.unknown_notified = False
                 allowed = self.eligible_ids is None or employee_id in self.eligible_ids
                 if allowed and employee_id not in self.emitted_ids:
                     self.emitted_ids.add(employee_id)
                     self.face_recognized.emit(employee_id, employee_name, float(similarity),
                                                face_info if face_info else {})
+            elif face_info is not None and not self.unknown_notified:
+                self.unknown_notified = True
+                self.unknown_face.emit()
+            elif face_info is None:
+                self.unknown_notified = False
             self.frame_ready.emit(frame)
         if self.camera:
             self.camera.release()
@@ -1521,6 +1529,7 @@ class AttendanceSystemGUI(QMainWindow):
         )
         self.camera_thread.frame_ready.connect(self.update_frame)
         self.camera_thread.face_recognized.connect(self.record_attendance)
+        self.camera_thread.unknown_face.connect(self.show_unknown_person)
         self.camera_thread.start()
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
@@ -1599,6 +1608,17 @@ class AttendanceSystemGUI(QMainWindow):
             elif self.camera_thread:
                 self.camera_thread.eligible_ids = set(remaining)
 
+
+    def show_unknown_person(self):
+        self.recognition_label.setText("UNKNOWN PERSON / NOT REGISTERED")
+        self.recognition_label.setStyleSheet(
+            f"color: {WARNING_ORANGE}; padding: 10px; font-weight: bold; font-size: 14px;"
+        )
+        if self.status_timer:
+            self.status_timer.stop()
+        self.status_timer = QTimer()
+        self.status_timer.timeout.connect(self.clear_recognition)
+        self.status_timer.start(2500)
 
     def clear_recognition(self):
         self.recognition_label.setText("Recognizing faces...")
