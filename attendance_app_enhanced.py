@@ -1935,7 +1935,7 @@ class AttendanceSystemGUI(QMainWindow):
         employee_names = []
         
         for row in range(self.current_table.rowCount()):
-            checkbox = self.current_table.cellWidget(row, 4)
+            checkbox = self.current_table.cellWidget(row, 6)
             if checkbox and checkbox.isChecked():
                 emp_id = self.current_table.item(row, 0).text()
                 emp_name = self.current_table.item(row, 1).text()
