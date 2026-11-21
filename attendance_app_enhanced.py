@@ -129,7 +129,9 @@ class InsightFaceCameraThread(QThread):
         self.daily_records = daily_records
 
     def run(self):
-        self.camera = cv2.VideoCapture(0)
+        # self.camera = cv2.VideoCapture(0)
+        self.camera = cv2.VideoCapture(0, cv2.CAP_MSMF)
+
         self.running = True
 
         while self.running:
