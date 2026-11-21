@@ -289,7 +289,8 @@ class DatabaseHelper:
                     'employee_id': row['employee_id'],
                     'employee_name': row['employee_name'],
                     'arrival_time': str(row['arrival_time']) if row['arrival_time'] else '-',
-                    'departure_time': str(row['departure_time']) if row['departure_time'] else '-',
+                    'departure_time': (str(row['departure_time']) if row['departure_time']
+                                       else ('PENDING' if row['arrival_time'] else '-')),
                     'working_duration': duration or '-',
                     'status': status
                 })
