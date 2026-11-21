@@ -2072,9 +2072,10 @@ class AttendanceSystemGUI(QMainWindow):
             self.db_helper.connection.commit()
             cursor.close()
         
-            self.deadline_set = False
-            self.deadline_time = time(12, 0)
-            self.start_btn.setEnabled(False)
+            # Clearing today's attendance must not reset the saved office schedule.
+            self.deadline_set = True
+            self.deadline_time = self.checkin_cutoff
+            self.start_btn.setEnabled(datetime.now().time() <= self.checkin_cutoff)
         
             self.update_clock()
             self.update_stats()
