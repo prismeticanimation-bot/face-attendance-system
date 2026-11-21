@@ -122,6 +122,26 @@ class DatabaseHelper:
             return {'checkin_time': '09:00:00', 'checkin_cutoff': '09:30:00',
                     'checkout_start': '18:00:00'}
 
+    def save_checkin_cutoff(self, cutoff_time):
+        """Persist the check-in closing time without changing the other office times."""
+        cursor = None
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                "UPDATE attendance_settings SET checkin_cutoff = %s WHERE settings_id = 1",
+                (cutoff_time,)
+            )
+            self.connection.commit()
+            return cursor.rowcount >= 0
+        except Error as e:
+            if self.connection:
+                self.connection.rollback()
+            print(f"Error saving attendance schedule: {e}")
+            return False
+        finally:
+            if cursor:
+                cursor.close()
+
     def record_check_in(self, employee_id, checkin_at=None):
         """Insert exactly one check-in per employee/day; never overwrite an existing one."""
         cursor = None
