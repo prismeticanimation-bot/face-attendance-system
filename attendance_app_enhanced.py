@@ -2131,11 +2131,25 @@ class AttendanceSystemGUI(QMainWindow):
         dialog.exec_()
 
     def open_deadline_settings(self):
-        dialog = DeadlineSettingsDialog(self.admin_dialog, self.deadline_time)
+        dialog = DeadlineSettingsDialog(self.admin_dialog, self.checkin_cutoff)
         if dialog.exec_() == QDialog.Accepted:
-            self.deadline_time = dialog.deadline_time
+            new_cutoff = dialog.deadline_time
+            if new_cutoff <= self.checkin_time:
+                QMessageBox.warning(
+                    self.admin_dialog, "Invalid Check-in Cutoff",
+                    "The check-in closing time must be later than the 9:00 AM on-time threshold."
+                )
+                return
+            if not self.db_helper.save_checkin_cutoff(new_cutoff.strftime('%H:%M:%S')):
+                QMessageBox.critical(
+                    self.admin_dialog, "Schedule Save Failed",
+                    "Could not save the check-in cutoff to the database."
+                )
+                return
+            self.checkin_cutoff = new_cutoff
+            self.deadline_time = new_cutoff
             self.deadline_set = True
-            self.start_btn.setEnabled(True)
+            self.start_btn.setEnabled(datetime.now().time() <= self.checkin_cutoff)
             self.update_clock()
             self.update_stats()
 
