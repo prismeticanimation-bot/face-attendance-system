@@ -1296,6 +1296,7 @@ class AttendanceSystemGUI(QMainWindow):
         self.current_table = None
 
         self.setup_ui()
+        self.start_btn.setEnabled(datetime.now().time() <= self.checkin_cutoff)
         self.setup_timers()
 
     def setup_ui(self):
