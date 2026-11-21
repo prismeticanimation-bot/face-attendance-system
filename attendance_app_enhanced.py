@@ -1458,7 +1458,9 @@ class AttendanceSystemGUI(QMainWindow):
         if self.camera_thread and self.camera_thread.running and self.camera_mode == "checkin":
             if now.time() > self.checkin_cutoff:
                 self.stop_recognition()
-        if now.time() >= self.checkout_start and self.checkout_auto_started_date != now.date():
+        if (hasattr(self, 'start_btn') and self.start_btn is not None
+                and now.time() >= self.checkout_start
+                and self.checkout_auto_started_date != now.date()):
             self.checkout_auto_started_date = now.date()
             self.start_checkout_scan(silent=True)
         if now.second == 0:
