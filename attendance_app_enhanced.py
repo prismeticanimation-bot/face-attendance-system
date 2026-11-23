@@ -6,6 +6,7 @@ sys.path.append(current_dir)
 
 import sys
 import csv
+import tempfile
 from datetime import date, datetime, time, timedelta
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QLabel, QLineEdit, QDialog, QFileDialog, QMessageBox, 
@@ -1001,230 +1002,376 @@ class DeadlineSettingsDialog(QDialog):
         self.accept()
 
 
+class EnrollmentCameraThread(QThread):
+    frame_ready = pyqtSignal(object, object, float)
+    camera_error = pyqtSignal(str)
+
+    def __init__(self, extractor):
+        super().__init__()
+        self.extractor = extractor
+        self.running = False
+        self.camera = None
+
+    def run(self):
+        self.camera = cv2.VideoCapture(0, cv2.CAP_MSMF)
+        if not self.camera.isOpened():
+            self.camera.release()
+            self.camera = None
+            self.camera_error.emit("Camera could not be opened. Check that it is not being used by another app.")
+            return
+
+        self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.running = True
+        frame_count = 0
+        last_bbox = None
+        last_score = 0.0
+
+        while self.running:
+            ret, frame = self.camera.read()
+            if not ret:
+                self.msleep(30)
+                continue
+
+            frame_count += 1
+            if frame_count % 3 == 0:
+                try:
+                    faces = self.extractor.app.get(frame)
+                    if faces:
+                        face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+                        last_bbox = tuple(int(v) for v in face.bbox)
+                        last_score = float(face.det_score)
+                    else:
+                        last_bbox = None
+                        last_score = 0.0
+                except Exception:
+                    last_bbox = None
+                    last_score = 0.0
+
+            self.frame_ready.emit(frame.copy(), last_bbox, last_score)
+            self.msleep(30)
+
+        if self.camera is not None:
+            self.camera.release()
+            self.camera = None
+
+    def stop(self):
+        self.running = False
+        if self.isRunning():
+            self.wait(4000)
+
+
 class AddEmployeeDialog(QDialog):
 
     def __init__(self, parent=None, db_helper=None, extractor=None):
         super().__init__(parent)
-        self.setWindowTitle("Add Employee")
-        self.setMinimumSize(500, 420)
+        self.setWindowTitle("Live Face Enrollment - Add Employee")
+        self.setMinimumSize(760, 650)
         self.setStyleSheet(f"""
             QDialog {{ background-color: {DARK_BG}; }}
             QMessageBox {{ background-color: {DARK_BG}; }}
             QMessageBox QLabel {{ color: {TEXT_PRIMARY}; }}
         """)
+
         self.db_helper = db_helper
         self.extractor = extractor
-        self.image_paths = [None, None, None]
+        self.camera_thread = None
+        self.latest_frame = None
+        self.latest_bbox = None
+        self.latest_score = 0.0
+        self.captured_frames = []
+        self.capture_stage = 0
+        self.stage_prompts = [
+            "1/3 — Look straight at the camera",
+            "2/3 — Turn your head slightly to the LEFT",
+            "3/3 — Turn your head slightly to the RIGHT"
+        ]
+        self.stage_timer = QTimer(self)
+        self.stage_timer.setSingleShot(True)
+        self.stage_timer.timeout.connect(self.capture_current_stage)
+
         self._setup_ui()
+        QTimer.singleShot(300, self.start_camera)
 
     def _setup_ui(self):
         layout = QVBoxLayout()
-        layout.setSpacing(15)
-        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+        layout.setContentsMargins(20, 16, 20, 16)
 
-        title = QLabel("Add New Employee")
-        title.setFont(QFont("Segoe UI", 14, QFont.Bold))
+        title = QLabel("Register New Employee")
+        title.setFont(QFont("Segoe UI", 16, QFont.Bold))
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet(f"color: {TEXT_PRIMARY};")
         layout.addWidget(title)
 
         form_layout = QFormLayout()
+        form_layout.setSpacing(10)
+
+        self.employee_id_input = QLineEdit()
+        self.employee_id_input.setPlaceholderText("Example: EMP002")
+        self.employee_name_input = QLineEdit()
+        self.employee_name_input.setPlaceholderText("Employee full name")
+
+        field_style = f"""
+            QLineEdit {{
+                background-color: {DARK_SECONDARY};
+                color: {TEXT_PRIMARY};
+                border: 1px solid {DARK_TERTIARY};
+                border-radius: 5px;
+                padding: 8px;
+            }}
+        """
+        self.employee_id_input.setStyleSheet(field_style)
+        self.employee_name_input.setStyleSheet(field_style)
 
         id_label = QLabel("Employee ID:")
-        id_label.setStyleSheet(f"color: {TEXT_PRIMARY};")
-        self.employee_id_input = QLineEdit()
-        self.employee_id_input.setPlaceholderText("Example: EMP001")
-        self.employee_id_input.setStyleSheet(f"""
-            QLineEdit {{
-                background-color: {DARK_SECONDARY};
-                color: {TEXT_PRIMARY};
-                border: 1px solid {DARK_TERTIARY};
-                border-radius: 5px;
-                padding: 8px;
-            }}
-        """)
-        form_layout.addRow(id_label, self.employee_id_input)
-
         name_label = QLabel("Employee Name:")
+        id_label.setStyleSheet(f"color: {TEXT_PRIMARY};")
         name_label.setStyleSheet(f"color: {TEXT_PRIMARY};")
-        self.employee_name_input = QLineEdit()
-        self.employee_name_input.setPlaceholderText("Example: Ahmed Mohamed")
-        self.employee_name_input.setStyleSheet(f"""
-            QLineEdit {{
-                background-color: {DARK_SECONDARY};
-                color: {TEXT_PRIMARY};
-                border: 1px solid {DARK_TERTIARY};
-                border-radius: 5px;
-                padding: 8px;
-            }}
-        """)
+        form_layout.addRow(id_label, self.employee_id_input)
         form_layout.addRow(name_label, self.employee_name_input)
         layout.addLayout(form_layout)
 
-        self.photos_label = QLabel("No photos selected")
-        self.photos_label.setAlignment(Qt.AlignCenter)
-        self.photos_label.setStyleSheet(f"color: {TEXT_SECONDARY}; padding: 10px;")
-        layout.addWidget(self.photos_label)
+        self.preview_label = QLabel("Opening camera...")
+        self.preview_label.setAlignment(Qt.AlignCenter)
+        self.preview_label.setFixedSize(640, 360)
+        self.preview_label.setStyleSheet(
+            f"background-color: {DARK_SECONDARY}; color: {TEXT_SECONDARY}; "
+            f"border: 1px solid {DARK_TERTIARY}; border-radius: 8px;"
+        )
+        preview_row = QHBoxLayout()
+        preview_row.addStretch()
+        preview_row.addWidget(self.preview_label)
+        preview_row.addStretch()
+        layout.addLayout(preview_row)
 
-        browse_btn = QPushButton("Select 3 Photos")
-        browse_btn.setFont(QFont("Segoe UI", 11, QFont.Bold))
-        browse_btn.setMinimumHeight(40)
-        browse_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {ACCENT_BLUE};
-                color: white;
-                border: none;
-                border-radius: 5px;
-            }}
-        """)
-        browse_btn.clicked.connect(self.browse_images)
-        layout.addWidget(browse_btn)
+        self.status_label = QLabel("Keep one face visible in the camera.")
+        self.status_label.setAlignment(Qt.AlignCenter)
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet(f"color: {TEXT_PRIMARY}; padding: 5px;")
+        layout.addWidget(self.status_label)
 
-        buttons_layout = QHBoxLayout()
-        save_btn = QPushButton("✓ Add Employee")
-        save_btn.setFont(QFont("Segoe UI", 11, QFont.Bold))
-        save_btn.setMinimumHeight(40)
-        save_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {SUCCESS_GREEN};
-                color: white;
-                border: none;
-                border-radius: 5px;
-            }}
-        """)
-        save_btn.clicked.connect(self.save_employee)
+        self.progress_label = QLabel("Captured samples: 0 / 3")
+        self.progress_label.setAlignment(Qt.AlignCenter)
+        self.progress_label.setStyleSheet(f"color: {TEXT_SECONDARY};")
+        layout.addWidget(self.progress_label)
 
-        cancel_btn = QPushButton("✕ Cancel")
-        cancel_btn.setFont(QFont("Segoe UI", 11, QFont.Bold))
-        cancel_btn.setMinimumHeight(40)
-        cancel_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {DARK_TERTIARY};
-                color: white;
-                border: none;
-                border-radius: 5px;
-            }}
-        """)
-        cancel_btn.clicked.connect(self.reject)
+        action_layout = QHBoxLayout()
+        self.camera_button = QPushButton("Restart Camera")
+        self.camera_button.clicked.connect(self.start_camera)
+        self.scan_button = QPushButton("Start Face Scan")
+        self.scan_button.setEnabled(False)
+        self.scan_button.clicked.connect(self.begin_enrollment)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self.reject)
 
-        buttons_layout.addWidget(save_btn)
-        buttons_layout.addWidget(cancel_btn)
-        layout.addLayout(buttons_layout)
+        self.camera_button.setMinimumHeight(40)
+        self.scan_button.setMinimumHeight(40)
+        self.cancel_button.setMinimumHeight(40)
+        self.camera_button.setStyleSheet(
+            f"QPushButton {{ background-color: {ACCENT_BLUE}; color: white; border: none; "
+            f"border-radius: 5px; padding: 8px; }}"
+        )
+        self.scan_button.setStyleSheet(
+            f"QPushButton {{ background-color: {SUCCESS_GREEN}; color: white; border: none; "
+            f"border-radius: 5px; padding: 8px; }}"
+        )
+        self.cancel_button.setStyleSheet(
+            f"QPushButton {{ background-color: {DARK_TERTIARY}; color: white; border: none; "
+            f"border-radius: 5px; padding: 8px; }}"
+        )
+        action_layout.addWidget(self.camera_button)
+        action_layout.addWidget(self.scan_button)
+        action_layout.addWidget(self.cancel_button)
+        layout.addLayout(action_layout)
+
         self.setLayout(layout)
 
-    def browse_images(self):
-        file_paths, _ = QFileDialog.getOpenFileNames(
-            self, "Select 3 Employee Photos", "", "Images (*.png *.jpg *.jpeg *.bmp *.webp)"
-        )
+    def start_camera(self):
+        if self.camera_thread is not None and self.camera_thread.isRunning():
+            self.camera_thread.stop()
 
-        if len(file_paths) != 3:
-            msg = QMessageBox(self)
-            msg.setWindowTitle("Error")
-            msg.setText("Please select exactly 3 photos")
-            msg.setStyleSheet(f"""
-                QMessageBox {{ background-color: {DARK_BG}; }}
-                QMessageBox QLabel {{ color: {TEXT_PRIMARY}; }}
-                QPushButton {{ 
-                    color: {TEXT_PRIMARY}; 
-                    background-color: {ACCENT_BLUE};
-                    border: none;
-                    border-radius: 3px;
-                    padding: 5px;
-                    min-width: 50px;
-                }}
-            """)
-            msg.exec_()
+        if self.extractor is None or not hasattr(self.extractor, "app"):
+            self.status_label.setText("Face recognition model is not available.")
             return
 
-        self.image_paths = file_paths
-        names = [p.split("/")[-1] for p in file_paths]
-        self.photos_label.setText("\n".join([f"{i+1}. {n}" for i, n in enumerate(names)]))
-        self.photos_label.setStyleSheet(f"color: {SUCCESS_GREEN}; padding: 10px;")
+        self.latest_frame = None
+        self.camera_thread = EnrollmentCameraThread(self.extractor)
+        self.camera_thread.frame_ready.connect(self.update_camera_frame)
+        self.camera_thread.camera_error.connect(self.show_camera_error)
+        self.camera_thread.start()
+        self.status_label.setText("Camera starting — position your face in the frame.")
+
+    def update_camera_frame(self, frame, bbox, score):
+        self.latest_frame = frame
+        self.latest_bbox = bbox
+        self.latest_score = score
+
+        display_frame = frame.copy()
+        if bbox is not None:
+            x1, y1, x2, y2 = bbox
+            cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 220, 100), 2)
+            cv2.putText(
+                display_frame, f"Face detected ({score:.2f})",
+                (max(10, x1), max(25, y1 - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 100), 2
+            )
+
+        rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+        height, width, channels = rgb.shape
+        image = QImage(
+            rgb.data, width, height, channels * width, QImage.Format_RGB888
+        ).copy()
+        pixmap = QPixmap.fromImage(image).scaled(
+            self.preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        self.preview_label.setPixmap(pixmap)
+
+        if bbox is not None and score >= 0.60:
+            self.scan_button.setEnabled(not self.stage_timer.isActive() and len(self.captured_frames) == 0)
+            if len(self.captured_frames) == 0 and not self.stage_timer.isActive():
+                self.status_label.setText("Face detected. Enter employee details, then start the scan.")
+        else:
+            self.scan_button.setEnabled(False)
+            if len(self.captured_frames) == 0 and not self.stage_timer.isActive():
+                self.status_label.setText("No clear face detected. Face the camera with good lighting.")
+
+    def show_camera_error(self, message):
+        self.scan_button.setEnabled(False)
+        self.preview_label.setText("Camera unavailable")
+        self.status_label.setText(message)
+
+    def begin_enrollment(self):
+        emp_id = self.employee_id_input.text().strip()
+        emp_name = self.employee_name_input.text().strip()
+
+        if not emp_id or not emp_name:
+            QMessageBox.warning(self, "Missing details", "Please enter Employee ID and Employee Name first.")
+            return
+
+        if self.latest_frame is None or self.latest_bbox is None or self.latest_score < 0.60:
+            QMessageBox.warning(self, "Face not detected", "Keep one clear face visible before starting enrollment.")
+            return
+
+        self.captured_frames = []
+        self.capture_stage = 0
+        self.scan_button.setEnabled(False)
+        self.camera_button.setEnabled(False)
+        self.employee_id_input.setEnabled(False)
+        self.employee_name_input.setEnabled(False)
+        self.capture_next_stage()
+
+    def capture_next_stage(self):
+        if self.capture_stage >= 3:
+            self.save_employee()
+            return
+
+        self.status_label.setText(
+            self.stage_prompts[self.capture_stage] +
+            "\nHold this position. Capturing automatically in about 2 seconds..."
+        )
+        self.stage_timer.start(2200)
+
+    def capture_current_stage(self):
+        if self.latest_frame is None or self.latest_bbox is None or self.latest_score < 0.60:
+            self.status_label.setText("Face not clear enough. Keep your face visible; trying again shortly...")
+            self.stage_timer.start(700)
+            return
+
+        x1, y1, x2, y2 = self.latest_bbox
+        if (x2 - x1) < 100 or (y2 - y1) < 100:
+            self.status_label.setText("Move a little closer to the camera. Retrying...")
+            self.stage_timer.start(700)
+            return
+
+        frame = self.latest_frame.copy()
+        embedding, _ = self.extractor.extract_face_embedding(frame)
+        if embedding is None:
+            self.status_label.setText("Could not extract a clear face sample. Please hold still...")
+            self.stage_timer.start(700)
+            return
+
+        self.captured_frames.append(frame)
+        self.capture_stage += 1
+        self.progress_label.setText(f"Captured samples: {len(self.captured_frames)} / 3")
+
+        if self.capture_stage < 3:
+            self.capture_next_stage()
+        else:
+            self.status_label.setText("All 3 samples captured. Saving employee and creating face embeddings...")
+            QTimer.singleShot(200, self.save_employee)
 
     def save_employee(self):
         emp_id = self.employee_id_input.text().strip()
         emp_name = self.employee_name_input.text().strip()
 
-        if not emp_id or not emp_name:
-            msg = QMessageBox(self)
-            msg.setWindowTitle("Error")
-            msg.setText("Please enter employee ID and name")
-            msg.setStyleSheet(f"""
-                QMessageBox {{ background-color: {DARK_BG}; }}
-                QMessageBox QLabel {{ color: {TEXT_PRIMARY}; }}
-                QPushButton {{ 
-                    color: {TEXT_PRIMARY}; 
-                    background-color: {ACCENT_BLUE};
-                    border: none;
-                    border-radius: 3px;
-                    padding: 5px;
-                    min-width: 50px;
-                }}
-            """)
-            msg.exec_()
+        if len(self.captured_frames) != 3:
+            QMessageBox.warning(self, "Enrollment incomplete", "Three face samples are required.")
             return
 
-        if None in self.image_paths:
-            msg = QMessageBox(self)
-            msg.setWindowTitle("Error")
-            msg.setText("Please select 3 photos")
-            msg.setStyleSheet(f"""
-                QMessageBox {{ background-color: {DARK_BG}; }}
-                QMessageBox QLabel {{ color: {TEXT_PRIMARY}; }}
-                QPushButton {{ 
-                    color: {TEXT_PRIMARY}; 
-                    background-color: {ACCENT_BLUE};
-                    border: none;
-                    border-radius: 3px;
-                    padding: 5px;
-                    min-width: 50px;
-                }}
-            """)
-            msg.exec_()
-            return
-
+        temp_dir = None
+        temp_paths = []
         try:
-            if self.db_helper.add_employee(emp_id, emp_name, self.image_paths[0], 
-                                          self.image_paths[1], self.image_paths[2]):
-                if self.extractor:
-                    self.extractor.embeddings_data = self.extractor.extract_embeddings_for_all_employees()
-                    self.extractor.save_embeddings(self.extractor.embeddings_data)
+            temp_dir = tempfile.mkdtemp(prefix="attendance_enrollment_")
+            for index, frame in enumerate(self.captured_frames, start=1):
+                image_path = os.path.join(temp_dir, f"face_{index}.jpg")
+                if not cv2.imwrite(image_path, frame):
+                    raise RuntimeError(f"Could not save captured face sample {index}.")
+                temp_paths.append(image_path)
 
-                msg = QMessageBox(self)
-                msg.setWindowTitle("Success")
-                msg.setText(f"{emp_name} added successfully!")
-                msg.setStyleSheet(f"""
-                    QMessageBox {{ background-color: {DARK_BG}; }}
-                    QMessageBox QLabel {{ color: {TEXT_PRIMARY}; }}
-                    QPushButton {{ 
-                        color: {TEXT_PRIMARY}; 
-                        background-color: {ACCENT_BLUE};
-                        border: none;
-                        border-radius: 3px;
-                        padding: 5px;
-                        min-width: 50px;
-                    }}
-                """)
-                msg.exec_()
-                self.accept()
+            added = self.db_helper.add_employee(
+                emp_id, emp_name, temp_paths[0], temp_paths[1], temp_paths[2]
+            )
+            if not added:
+                raise RuntimeError("Employee could not be added. Check whether this Employee ID already exists.")
+
+            self.extractor.embeddings_data = self.extractor.extract_embeddings_for_all_employees()
+            self.extractor.save_embeddings(self.extractor.embeddings_data)
+
+            QMessageBox.information(
+                self, "Enrollment successful",
+                f"{emp_name} ({emp_id}) has been registered using live camera samples."
+            )
+            self.accept()
+
         except Exception as e:
-            msg = QMessageBox(self)
-            msg.setWindowTitle("Error")
-            msg.setText(str(e))
-            msg.setStyleSheet(f"""
-                QMessageBox {{ background-color: {DARK_BG}; }}
-                QMessageBox QLabel {{ color: {TEXT_PRIMARY}; }}
-                QPushButton {{ 
-                    color: {TEXT_PRIMARY}; 
-                    background-color: {ACCENT_BLUE};
-                    border: none;
-                    border-radius: 3px;
-                    padding: 5px;
-                    min-width: 50px;
-                }}
-            """)
-            msg.exec_()
+            QMessageBox.critical(self, "Enrollment error", str(e))
+            self.captured_frames = []
+            self.capture_stage = 0
+            self.progress_label.setText("Captured samples: 0 / 3")
+            self.scan_button.setEnabled(self.latest_bbox is not None and self.latest_score >= 0.60)
+            self.camera_button.setEnabled(True)
+            self.employee_id_input.setEnabled(True)
+            self.employee_name_input.setEnabled(True)
+        finally:
+            for path in temp_paths:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            if temp_dir:
+                try:
+                    os.rmdir(temp_dir)
+                except OSError:
+                    pass
 
+    def _stop_camera(self):
+        self.stage_timer.stop()
+        if self.camera_thread is not None and self.camera_thread.isRunning():
+            self.camera_thread.stop()
+        self.camera_thread = None
+
+    def accept(self):
+        self._stop_camera()
+        super().accept()
+
+    def reject(self):
+        self._stop_camera()
+        super().reject()
+
+    def closeEvent(self, event):
+        self._stop_camera()
+        super().closeEvent(event)
 
 class AttendanceSystemGUI(QMainWindow):
 
