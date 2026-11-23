@@ -16,7 +16,8 @@ class DatabaseHelper:
         # the source; the previous hard-coded values remain the defaults.
         host = host if host is not None else os.environ.get('ATTENDANCE_DB_HOST', 'localhost')
         user = user if user is not None else os.environ.get('ATTENDANCE_DB_USER', 'root')
-        password = password if password is not None else os.environ.get('ATTENDANCE_DB_PASSWORD', '1234')
+        # password = password if password is not None else os.environ.get('ATTENDANCE_DB_PASSWORD', '1234')
+        password = password if password is not None else os.environ.get('ATTENDANCE_DB_PASSWORD', 'lewis44ham')
         database = database if database is not None else os.environ.get('ATTENDANCE_DB_NAME', 'attend')
 
         self.host = host
@@ -27,6 +28,10 @@ class DatabaseHelper:
 
     def connect(self):
 
+        print("DB USER:", repr(self.user))                                           #NEW LINE ADDED
+        print("DB HOST:", repr(self.host))                                           #NEW LINE ADDED
+        print("DB NAME:", repr(self.database))                                       #NEW LINE ADDED  
+        print("PASSWORD LENGTH:", len(self.password) if self.password else 0)        #NEW LINE ADDED
         try:
             self.connection = mysql.connector.connect(
                 host=self.host,
