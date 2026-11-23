@@ -1290,6 +1290,7 @@ class AttendanceSystemGUI(QMainWindow):
         self.checkout_start = datetime.strptime(self.schedule['checkout_start'], '%H:%M:%S').time()
         self.camera_mode = None
         self.checkout_auto_started_date = None
+        self.checkout_completed = False
         self.deadline_time = self.checkin_cutoff
         self.deadline_set = True
         self.admin_dialog = None
@@ -1526,6 +1527,7 @@ class AttendanceSystemGUI(QMainWindow):
         if self.camera_thread and self.camera_thread.running:
             return
         self.camera_mode = mode
+        self.checkout_completed = False
         eligible = pending_ids if mode == "checkout" else None
         self.camera_thread = InsightFaceCameraThread(
             self.extractor, self.embeddings_data, mode=mode, eligible_ids=eligible
@@ -1607,7 +1609,19 @@ class AttendanceSystemGUI(QMainWindow):
         if self.camera_mode == "checkout":
             remaining = self.db_helper.get_pending_checkouts(date.today())
             if not remaining:
-                self.stop_recognition()
+                # Keep camera preview live after the scan completes; recognition is disabled
+                # for further check-outs by clearing the eligible employee IDs.
+                self.checkout_completed = True
+                if self.camera_thread:
+                    self.camera_thread.eligible_ids = set()
+                self.recognition_label.setText(
+                    f"✓ All check-outs completed for today\nLast: {employee_name} | {result['time']}"
+                )
+                self.recognition_label.setStyleSheet(
+                    f"color: {SUCCESS_GREEN}; padding: 10px; font-weight: bold; font-size: 14px;"
+                )
+                if self.status_timer:
+                    self.status_timer.stop()
             elif self.camera_thread:
                 self.camera_thread.eligible_ids = set(remaining)
 
@@ -1624,7 +1638,10 @@ class AttendanceSystemGUI(QMainWindow):
         self.status_timer.start(2500)
 
     def clear_recognition(self):
-        self.recognition_label.setText("Recognizing faces...")
+        if self.checkout_completed and self.camera_mode == "checkout":
+            self.recognition_label.setText("✓ All check-outs completed for today | Camera live")
+        else:
+            self.recognition_label.setText("Recognizing faces...")
         self.recognition_label.setStyleSheet(f"color: {SUCCESS_GREEN}; padding: 10px;")
         if self.status_timer:
             self.status_timer.stop()
