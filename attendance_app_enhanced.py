@@ -1335,7 +1335,10 @@ class AddEmployeeDialog(QDialog):
 
         except Exception as e:
             QMessageBox.critical(self, "Enrollment error", str(e))
-            self.scan_button.setEnabled(True)
+            self.captured_frames = []
+            self.capture_stage = 0
+            self.progress_label.setText("Captured samples: 0 / 3")
+            self.scan_button.setEnabled(self.latest_bbox is not None and self.latest_score >= 0.60)
             self.camera_button.setEnabled(True)
             self.employee_id_input.setEnabled(True)
             self.employee_name_input.setEnabled(True)
