@@ -1,10 +1,11 @@
 import os
 
+from dateutil.utils import today
 import mysql.connector
 from mysql.connector import Error
 import cv2
 import numpy as np
-from datetime import datetime, date
+from datetime import datetime, date , timedelta
 
 
 class DatabaseHelper:
@@ -211,6 +212,11 @@ class DatabaseHelper:
             if departure_time is not None:
                 return {'ok': False, 'reason': 'already_checked_out'}
 
+            if isinstance(arrival_time, timedelta):
+             total_seconds = int(arrival_time.total_seconds()) % 86400
+            arrival_time = (datetime.min + timedelta(seconds=total_seconds)).time()
+
+            arrival_dt = datetime.combine(today, arrival_time)
             arrival_dt = datetime.combine(today, arrival_time)
             checkout_dt = datetime.combine(today, checkout_time)
             if checkout_dt < arrival_dt:
