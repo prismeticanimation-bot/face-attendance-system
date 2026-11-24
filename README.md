@@ -131,3 +131,29 @@ has been given reference images for.
 ## License
 
 [MIT](LICENSE)
+
+## Scheduled check-in and check-out
+
+The desktop app supports one attendance row per employee per day:
+
+- **On-time check-in:** 9:00 AM or earlier (PRESENT).
+- **Grace period:** after 9:00 AM through 9:30 AM (LATE).
+- **Check-in closes:** after 9:30 AM. This does not disable the evening scan.
+- **Automatic check-out scan:** starts at 6:00 PM and keeps scanning for employees who checked in but do not yet have a check-out.
+- Each employee can be checked out once per day. Working duration is stored as elapsed seconds between check-in and check-out.
+- Unknown/unregistered faces are displayed but never written to attendance.
+- The admin can stop the camera manually. The check-in cutoff can be adjusted in the admin panel and is stored in MySQL.
+
+### Existing database upgrade
+
+**Back up the `attend` database before running any migration.** The migration below adds nullable check-out columns and a schedule table; it does not delete or rewrite existing attendance rows.
+
+Run once from Windows Command Prompt (adjust the MySQL executable path if needed):
+
+```bat
+mysql -u root -p attend < migrations/001_checkin_checkout.sql
+```
+
+Enter the MySQL password at the prompt. Do not put database passwords in source code or commit them to GitHub.
+
+For a brand-new database, use the updated `schema.sql` instead of running the migration.

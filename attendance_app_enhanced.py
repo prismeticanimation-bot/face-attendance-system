@@ -1,21 +1,24 @@
 import os
 import sys
+import tempfile
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(current_dir)
 
 import sys
 import csv
+import tempfile
 from datetime import date, datetime, time, timedelta
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QLabel, QLineEdit, QDialog, QFileDialog, QMessageBox, 
                              QTableWidget, QTableWidgetItem, QGroupBox, QFormLayout, QTimeEdit,
-                             QCheckBox, QListWidget, QListWidgetItem, QScrollArea, QHeaderView)
+                             QCheckBox, QListWidget, QListWidgetItem, QScrollArea, QHeaderView, QComboBox)
 from PyQt5.QtCore import QTimer, Qt, QThread, pyqtSignal, QTime, QSize, QRect
 from PyQt5.QtGui import QImage, QPixmap, QFont, QColor, QIcon, QPainter, QBrush
 import cv2
 import numpy as np
 from database_helper import DatabaseHelper
 from insightface_embeddings import InsightFaceEmbeddingExtractor
+from monthly_payroll import MonthlyPayrollDialog
 
 DARK_BG = "#18191A"
 DARK_SECONDARY = "#242526"
@@ -119,38 +122,49 @@ class ImageViewerDialog(QDialog):
 class InsightFaceCameraThread(QThread):
     frame_ready = pyqtSignal(object)
     face_recognized = pyqtSignal(str, str, float, dict)
+    unknown_face = pyqtSignal()
 
-    def __init__(self, extractor, embeddings_data, daily_records):
+    def __init__(self, extractor, embeddings_data, mode="checkin", eligible_ids=None):
         super().__init__()
         self.extractor = extractor
         self.embeddings_data = embeddings_data
+        self.mode = mode
+        self.eligible_ids = set(eligible_ids) if eligible_ids is not None else None
         self.running = False
         self.camera = None
-        self.daily_records = daily_records
+        self.emitted_ids = set()
+        self.unknown_notified = False
 
     def run(self):
-        # self.camera = cv2.VideoCapture(0)
         self.camera = cv2.VideoCapture(0, cv2.CAP_MSMF)
-
         self.running = True
-
+        if not self.camera.isOpened():
+            self.running = False
+            self.frame_ready.emit(None)
+            return
         while self.running:
             ret, frame = self.camera.read()
-            if ret:
-                employee_id, similarity, employee_name, face_info = self.extractor.recognize_face_from_embedding(
-                    frame, self.embeddings_data
-                )
-
-                if employee_id and similarity > self.extractor.threshold:
-                    if employee_id not in self.daily_records:
-                        self.face_recognized.emit(employee_id, employee_name, float(similarity), 
-                                                 face_info if face_info else {})
-                        self.daily_records[employee_id] = datetime.now()
-
-                self.frame_ready.emit(frame)
-
+            if not ret:
+                continue
+            employee_id, similarity, employee_name, face_info = (
+                self.extractor.recognize_face_from_embedding(frame, self.embeddings_data)
+            )
+            if employee_id and similarity > self.extractor.threshold:
+                self.unknown_notified = False
+                allowed = self.eligible_ids is None or employee_id in self.eligible_ids
+                if allowed and employee_id not in self.emitted_ids:
+                    self.emitted_ids.add(employee_id)
+                    self.face_recognized.emit(employee_id, employee_name, float(similarity),
+                                               face_info if face_info else {})
+            elif face_info is not None and not self.unknown_notified:
+                self.unknown_notified = True
+                self.unknown_face.emit()
+            elif face_info is None:
+                self.unknown_notified = False
+            self.frame_ready.emit(frame)
         if self.camera:
             self.camera.release()
+            self.camera = None
 
     def stop(self):
         self.running = False
@@ -989,230 +1003,376 @@ class DeadlineSettingsDialog(QDialog):
         self.accept()
 
 
+class EnrollmentCameraThread(QThread):
+    frame_ready = pyqtSignal(object, object, float)
+    camera_error = pyqtSignal(str)
+
+    def __init__(self, extractor):
+        super().__init__()
+        self.extractor = extractor
+        self.running = False
+        self.camera = None
+
+    def run(self):
+        self.camera = cv2.VideoCapture(0, cv2.CAP_MSMF)
+        if not self.camera.isOpened():
+            self.camera.release()
+            self.camera = None
+            self.camera_error.emit("Camera could not be opened. Check that it is not being used by another app.")
+            return
+
+        self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.running = True
+        frame_count = 0
+        last_bbox = None
+        last_score = 0.0
+
+        while self.running:
+            ret, frame = self.camera.read()
+            if not ret:
+                self.msleep(30)
+                continue
+
+            frame_count += 1
+            if frame_count % 3 == 0:
+                try:
+                    faces = self.extractor.app.get(frame)
+                    if faces:
+                        face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+                        last_bbox = tuple(int(v) for v in face.bbox)
+                        last_score = float(face.det_score)
+                    else:
+                        last_bbox = None
+                        last_score = 0.0
+                except Exception:
+                    last_bbox = None
+                    last_score = 0.0
+
+            self.frame_ready.emit(frame.copy(), last_bbox, last_score)
+            self.msleep(30)
+
+        if self.camera is not None:
+            self.camera.release()
+            self.camera = None
+
+    def stop(self):
+        self.running = False
+        if self.isRunning():
+            self.wait(4000)
+
+
 class AddEmployeeDialog(QDialog):
 
     def __init__(self, parent=None, db_helper=None, extractor=None):
         super().__init__(parent)
-        self.setWindowTitle("Add Employee")
-        self.setMinimumSize(500, 420)
+        self.setWindowTitle("Live Face Enrollment - Add Employee")
+        self.setMinimumSize(760, 650)
         self.setStyleSheet(f"""
             QDialog {{ background-color: {DARK_BG}; }}
             QMessageBox {{ background-color: {DARK_BG}; }}
             QMessageBox QLabel {{ color: {TEXT_PRIMARY}; }}
         """)
+
         self.db_helper = db_helper
         self.extractor = extractor
-        self.image_paths = [None, None, None]
+        self.camera_thread = None
+        self.latest_frame = None
+        self.latest_bbox = None
+        self.latest_score = 0.0
+        self.captured_frames = []
+        self.capture_stage = 0
+        self.stage_prompts = [
+            "1/3 — Look straight at the camera",
+            "2/3 — Turn your head slightly to the LEFT",
+            "3/3 — Turn your head slightly to the RIGHT"
+        ]
+        self.stage_timer = QTimer(self)
+        self.stage_timer.setSingleShot(True)
+        self.stage_timer.timeout.connect(self.capture_current_stage)
+
         self._setup_ui()
+        QTimer.singleShot(300, self.start_camera)
 
     def _setup_ui(self):
         layout = QVBoxLayout()
-        layout.setSpacing(15)
-        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+        layout.setContentsMargins(20, 16, 20, 16)
 
-        title = QLabel("Add New Employee")
-        title.setFont(QFont("Segoe UI", 14, QFont.Bold))
+        title = QLabel("Register New Employee")
+        title.setFont(QFont("Segoe UI", 16, QFont.Bold))
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet(f"color: {TEXT_PRIMARY};")
         layout.addWidget(title)
 
         form_layout = QFormLayout()
+        form_layout.setSpacing(10)
+
+        self.employee_id_input = QLineEdit()
+        self.employee_id_input.setPlaceholderText("Example: EMP002")
+        self.employee_name_input = QLineEdit()
+        self.employee_name_input.setPlaceholderText("Employee full name")
+
+        field_style = f"""
+            QLineEdit {{
+                background-color: {DARK_SECONDARY};
+                color: {TEXT_PRIMARY};
+                border: 1px solid {DARK_TERTIARY};
+                border-radius: 5px;
+                padding: 8px;
+            }}
+        """
+        self.employee_id_input.setStyleSheet(field_style)
+        self.employee_name_input.setStyleSheet(field_style)
 
         id_label = QLabel("Employee ID:")
-        id_label.setStyleSheet(f"color: {TEXT_PRIMARY};")
-        self.employee_id_input = QLineEdit()
-        self.employee_id_input.setPlaceholderText("Example: EMP001")
-        self.employee_id_input.setStyleSheet(f"""
-            QLineEdit {{
-                background-color: {DARK_SECONDARY};
-                color: {TEXT_PRIMARY};
-                border: 1px solid {DARK_TERTIARY};
-                border-radius: 5px;
-                padding: 8px;
-            }}
-        """)
-        form_layout.addRow(id_label, self.employee_id_input)
-
         name_label = QLabel("Employee Name:")
+        id_label.setStyleSheet(f"color: {TEXT_PRIMARY};")
         name_label.setStyleSheet(f"color: {TEXT_PRIMARY};")
-        self.employee_name_input = QLineEdit()
-        self.employee_name_input.setPlaceholderText("Example: Ahmed Mohamed")
-        self.employee_name_input.setStyleSheet(f"""
-            QLineEdit {{
-                background-color: {DARK_SECONDARY};
-                color: {TEXT_PRIMARY};
-                border: 1px solid {DARK_TERTIARY};
-                border-radius: 5px;
-                padding: 8px;
-            }}
-        """)
+        form_layout.addRow(id_label, self.employee_id_input)
         form_layout.addRow(name_label, self.employee_name_input)
         layout.addLayout(form_layout)
 
-        self.photos_label = QLabel("No photos selected")
-        self.photos_label.setAlignment(Qt.AlignCenter)
-        self.photos_label.setStyleSheet(f"color: {TEXT_SECONDARY}; padding: 10px;")
-        layout.addWidget(self.photos_label)
+        self.preview_label = QLabel("Opening camera...")
+        self.preview_label.setAlignment(Qt.AlignCenter)
+        self.preview_label.setFixedSize(640, 360)
+        self.preview_label.setStyleSheet(
+            f"background-color: {DARK_SECONDARY}; color: {TEXT_SECONDARY}; "
+            f"border: 1px solid {DARK_TERTIARY}; border-radius: 8px;"
+        )
+        preview_row = QHBoxLayout()
+        preview_row.addStretch()
+        preview_row.addWidget(self.preview_label)
+        preview_row.addStretch()
+        layout.addLayout(preview_row)
 
-        browse_btn = QPushButton("Select 3 Photos")
-        browse_btn.setFont(QFont("Segoe UI", 11, QFont.Bold))
-        browse_btn.setMinimumHeight(40)
-        browse_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {ACCENT_BLUE};
-                color: white;
-                border: none;
-                border-radius: 5px;
-            }}
-        """)
-        browse_btn.clicked.connect(self.browse_images)
-        layout.addWidget(browse_btn)
+        self.status_label = QLabel("Keep one face visible in the camera.")
+        self.status_label.setAlignment(Qt.AlignCenter)
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet(f"color: {TEXT_PRIMARY}; padding: 5px;")
+        layout.addWidget(self.status_label)
 
-        buttons_layout = QHBoxLayout()
-        save_btn = QPushButton("✓ Add Employee")
-        save_btn.setFont(QFont("Segoe UI", 11, QFont.Bold))
-        save_btn.setMinimumHeight(40)
-        save_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {SUCCESS_GREEN};
-                color: white;
-                border: none;
-                border-radius: 5px;
-            }}
-        """)
-        save_btn.clicked.connect(self.save_employee)
+        self.progress_label = QLabel("Captured samples: 0 / 3")
+        self.progress_label.setAlignment(Qt.AlignCenter)
+        self.progress_label.setStyleSheet(f"color: {TEXT_SECONDARY};")
+        layout.addWidget(self.progress_label)
 
-        cancel_btn = QPushButton("✕ Cancel")
-        cancel_btn.setFont(QFont("Segoe UI", 11, QFont.Bold))
-        cancel_btn.setMinimumHeight(40)
-        cancel_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {DARK_TERTIARY};
-                color: white;
-                border: none;
-                border-radius: 5px;
-            }}
-        """)
-        cancel_btn.clicked.connect(self.reject)
+        action_layout = QHBoxLayout()
+        self.camera_button = QPushButton("Restart Camera")
+        self.camera_button.clicked.connect(self.start_camera)
+        self.scan_button = QPushButton("Start Face Scan")
+        self.scan_button.setEnabled(False)
+        self.scan_button.clicked.connect(self.begin_enrollment)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self.reject)
 
-        buttons_layout.addWidget(save_btn)
-        buttons_layout.addWidget(cancel_btn)
-        layout.addLayout(buttons_layout)
+        self.camera_button.setMinimumHeight(40)
+        self.scan_button.setMinimumHeight(40)
+        self.cancel_button.setMinimumHeight(40)
+        self.camera_button.setStyleSheet(
+            f"QPushButton {{ background-color: {ACCENT_BLUE}; color: white; border: none; "
+            f"border-radius: 5px; padding: 8px; }}"
+        )
+        self.scan_button.setStyleSheet(
+            f"QPushButton {{ background-color: {SUCCESS_GREEN}; color: white; border: none; "
+            f"border-radius: 5px; padding: 8px; }}"
+        )
+        self.cancel_button.setStyleSheet(
+            f"QPushButton {{ background-color: {DARK_TERTIARY}; color: white; border: none; "
+            f"border-radius: 5px; padding: 8px; }}"
+        )
+        action_layout.addWidget(self.camera_button)
+        action_layout.addWidget(self.scan_button)
+        action_layout.addWidget(self.cancel_button)
+        layout.addLayout(action_layout)
+
         self.setLayout(layout)
 
-    def browse_images(self):
-        file_paths, _ = QFileDialog.getOpenFileNames(
-            self, "Select 3 Employee Photos", "", "Images (*.png *.jpg *.jpeg *.bmp *.webp)"
-        )
+    def start_camera(self):
+        if self.camera_thread is not None and self.camera_thread.isRunning():
+            self.camera_thread.stop()
 
-        if len(file_paths) != 3:
-            msg = QMessageBox(self)
-            msg.setWindowTitle("Error")
-            msg.setText("Please select exactly 3 photos")
-            msg.setStyleSheet(f"""
-                QMessageBox {{ background-color: {DARK_BG}; }}
-                QMessageBox QLabel {{ color: {TEXT_PRIMARY}; }}
-                QPushButton {{ 
-                    color: {TEXT_PRIMARY}; 
-                    background-color: {ACCENT_BLUE};
-                    border: none;
-                    border-radius: 3px;
-                    padding: 5px;
-                    min-width: 50px;
-                }}
-            """)
-            msg.exec_()
+        if self.extractor is None or not hasattr(self.extractor, "app"):
+            self.status_label.setText("Face recognition model is not available.")
             return
 
-        self.image_paths = file_paths
-        names = [p.split("/")[-1] for p in file_paths]
-        self.photos_label.setText("\n".join([f"{i+1}. {n}" for i, n in enumerate(names)]))
-        self.photos_label.setStyleSheet(f"color: {SUCCESS_GREEN}; padding: 10px;")
+        self.latest_frame = None
+        self.camera_thread = EnrollmentCameraThread(self.extractor)
+        self.camera_thread.frame_ready.connect(self.update_camera_frame)
+        self.camera_thread.camera_error.connect(self.show_camera_error)
+        self.camera_thread.start()
+        self.status_label.setText("Camera starting — position your face in the frame.")
+
+    def update_camera_frame(self, frame, bbox, score):
+        self.latest_frame = frame
+        self.latest_bbox = bbox
+        self.latest_score = score
+
+        display_frame = frame.copy()
+        if bbox is not None:
+            x1, y1, x2, y2 = bbox
+            cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 220, 100), 2)
+            cv2.putText(
+                display_frame, f"Face detected ({score:.2f})",
+                (max(10, x1), max(25, y1 - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 100), 2
+            )
+
+        rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+        height, width, channels = rgb.shape
+        image = QImage(
+            rgb.data, width, height, channels * width, QImage.Format_RGB888
+        ).copy()
+        pixmap = QPixmap.fromImage(image).scaled(
+            self.preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        self.preview_label.setPixmap(pixmap)
+
+        if bbox is not None and score >= 0.60:
+            self.scan_button.setEnabled(not self.stage_timer.isActive() and len(self.captured_frames) == 0)
+            if len(self.captured_frames) == 0 and not self.stage_timer.isActive():
+                self.status_label.setText("Face detected. Enter employee details, then start the scan.")
+        else:
+            self.scan_button.setEnabled(False)
+            if len(self.captured_frames) == 0 and not self.stage_timer.isActive():
+                self.status_label.setText("No clear face detected. Face the camera with good lighting.")
+
+    def show_camera_error(self, message):
+        self.scan_button.setEnabled(False)
+        self.preview_label.setText("Camera unavailable")
+        self.status_label.setText(message)
+
+    def begin_enrollment(self):
+        emp_id = self.employee_id_input.text().strip()
+        emp_name = self.employee_name_input.text().strip()
+
+        if not emp_id or not emp_name:
+            QMessageBox.warning(self, "Missing details", "Please enter Employee ID and Employee Name first.")
+            return
+
+        if self.latest_frame is None or self.latest_bbox is None or self.latest_score < 0.60:
+            QMessageBox.warning(self, "Face not detected", "Keep one clear face visible before starting enrollment.")
+            return
+
+        self.captured_frames = []
+        self.capture_stage = 0
+        self.scan_button.setEnabled(False)
+        self.camera_button.setEnabled(False)
+        self.employee_id_input.setEnabled(False)
+        self.employee_name_input.setEnabled(False)
+        self.capture_next_stage()
+
+    def capture_next_stage(self):
+        if self.capture_stage >= 3:
+            self.save_employee()
+            return
+
+        self.status_label.setText(
+            self.stage_prompts[self.capture_stage] +
+            "\nHold this position. Capturing automatically in about 2 seconds..."
+        )
+        self.stage_timer.start(2200)
+
+    def capture_current_stage(self):
+        if self.latest_frame is None or self.latest_bbox is None or self.latest_score < 0.60:
+            self.status_label.setText("Face not clear enough. Keep your face visible; trying again shortly...")
+            self.stage_timer.start(700)
+            return
+
+        x1, y1, x2, y2 = self.latest_bbox
+        if (x2 - x1) < 100 or (y2 - y1) < 100:
+            self.status_label.setText("Move a little closer to the camera. Retrying...")
+            self.stage_timer.start(700)
+            return
+
+        frame = self.latest_frame.copy()
+        embedding, _ = self.extractor.extract_face_embedding(frame)
+        if embedding is None:
+            self.status_label.setText("Could not extract a clear face sample. Please hold still...")
+            self.stage_timer.start(700)
+            return
+
+        self.captured_frames.append(frame)
+        self.capture_stage += 1
+        self.progress_label.setText(f"Captured samples: {len(self.captured_frames)} / 3")
+
+        if self.capture_stage < 3:
+            self.capture_next_stage()
+        else:
+            self.status_label.setText("All 3 samples captured. Saving employee and creating face embeddings...")
+            QTimer.singleShot(200, self.save_employee)
 
     def save_employee(self):
         emp_id = self.employee_id_input.text().strip()
         emp_name = self.employee_name_input.text().strip()
 
-        if not emp_id or not emp_name:
-            msg = QMessageBox(self)
-            msg.setWindowTitle("Error")
-            msg.setText("Please enter employee ID and name")
-            msg.setStyleSheet(f"""
-                QMessageBox {{ background-color: {DARK_BG}; }}
-                QMessageBox QLabel {{ color: {TEXT_PRIMARY}; }}
-                QPushButton {{ 
-                    color: {TEXT_PRIMARY}; 
-                    background-color: {ACCENT_BLUE};
-                    border: none;
-                    border-radius: 3px;
-                    padding: 5px;
-                    min-width: 50px;
-                }}
-            """)
-            msg.exec_()
+        if len(self.captured_frames) != 3:
+            QMessageBox.warning(self, "Enrollment incomplete", "Three face samples are required.")
             return
 
-        if None in self.image_paths:
-            msg = QMessageBox(self)
-            msg.setWindowTitle("Error")
-            msg.setText("Please select 3 photos")
-            msg.setStyleSheet(f"""
-                QMessageBox {{ background-color: {DARK_BG}; }}
-                QMessageBox QLabel {{ color: {TEXT_PRIMARY}; }}
-                QPushButton {{ 
-                    color: {TEXT_PRIMARY}; 
-                    background-color: {ACCENT_BLUE};
-                    border: none;
-                    border-radius: 3px;
-                    padding: 5px;
-                    min-width: 50px;
-                }}
-            """)
-            msg.exec_()
-            return
-
+        temp_dir = None
+        temp_paths = []
         try:
-            if self.db_helper.add_employee(emp_id, emp_name, self.image_paths[0], 
-                                          self.image_paths[1], self.image_paths[2]):
-                if self.extractor:
-                    self.extractor.embeddings_data = self.extractor.extract_embeddings_for_all_employees()
-                    self.extractor.save_embeddings(self.extractor.embeddings_data)
+            temp_dir = tempfile.mkdtemp(prefix="attendance_enrollment_")
+            for index, frame in enumerate(self.captured_frames, start=1):
+                image_path = os.path.join(temp_dir, f"face_{index}.jpg")
+                if not cv2.imwrite(image_path, frame):
+                    raise RuntimeError(f"Could not save captured face sample {index}.")
+                temp_paths.append(image_path)
 
-                msg = QMessageBox(self)
-                msg.setWindowTitle("Success")
-                msg.setText(f"{emp_name} added successfully!")
-                msg.setStyleSheet(f"""
-                    QMessageBox {{ background-color: {DARK_BG}; }}
-                    QMessageBox QLabel {{ color: {TEXT_PRIMARY}; }}
-                    QPushButton {{ 
-                        color: {TEXT_PRIMARY}; 
-                        background-color: {ACCENT_BLUE};
-                        border: none;
-                        border-radius: 3px;
-                        padding: 5px;
-                        min-width: 50px;
-                    }}
-                """)
-                msg.exec_()
-                self.accept()
+            added = self.db_helper.add_employee(
+                emp_id, emp_name, temp_paths[0], temp_paths[1], temp_paths[2]
+            )
+            if not added:
+                raise RuntimeError("Employee could not be added. Check whether this Employee ID already exists.")
+
+            self.extractor.embeddings_data = self.extractor.extract_embeddings_for_all_employees()
+            self.extractor.save_embeddings(self.extractor.embeddings_data)
+
+            QMessageBox.information(
+                self, "Enrollment successful",
+                f"{emp_name} ({emp_id}) has been registered using live camera samples."
+            )
+            self.accept()
+
         except Exception as e:
-            msg = QMessageBox(self)
-            msg.setWindowTitle("Error")
-            msg.setText(str(e))
-            msg.setStyleSheet(f"""
-                QMessageBox {{ background-color: {DARK_BG}; }}
-                QMessageBox QLabel {{ color: {TEXT_PRIMARY}; }}
-                QPushButton {{ 
-                    color: {TEXT_PRIMARY}; 
-                    background-color: {ACCENT_BLUE};
-                    border: none;
-                    border-radius: 3px;
-                    padding: 5px;
-                    min-width: 50px;
-                }}
-            """)
-            msg.exec_()
+            QMessageBox.critical(self, "Enrollment error", str(e))
+            self.captured_frames = []
+            self.capture_stage = 0
+            self.progress_label.setText("Captured samples: 0 / 3")
+            self.scan_button.setEnabled(self.latest_bbox is not None and self.latest_score >= 0.60)
+            self.camera_button.setEnabled(True)
+            self.employee_id_input.setEnabled(True)
+            self.employee_name_input.setEnabled(True)
+        finally:
+            for path in temp_paths:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            if temp_dir:
+                try:
+                    os.rmdir(temp_dir)
+                except OSError:
+                    pass
 
+    def _stop_camera(self):
+        self.stage_timer.stop()
+        if self.camera_thread is not None and self.camera_thread.isRunning():
+            self.camera_thread.stop()
+        self.camera_thread = None
+
+    def accept(self):
+        self._stop_camera()
+        super().accept()
+
+    def reject(self):
+        self._stop_camera()
+        super().reject()
+
+    def closeEvent(self, event):
+        self._stop_camera()
+        super().closeEvent(event)
 
 class AttendanceSystemGUI(QMainWindow):
 
@@ -1229,6 +1389,7 @@ class AttendanceSystemGUI(QMainWindow):
         self.camera_label = None
         self.recognition_label = None
         self.start_btn = None
+        self.checkout_btn = None
         self.stop_btn = None
         self.admin_btn = None
 
@@ -1273,12 +1434,20 @@ class AttendanceSystemGUI(QMainWindow):
         self.session_daily_records = {}
         self.camera_thread = None
         self.status_timer = None
-        self.deadline_time = time(12, 0)
-        self.deadline_set = False
+        self.schedule = self.db_helper.get_attendance_schedule()
+        self.checkin_time = datetime.strptime(self.schedule['checkin_time'], '%H:%M:%S').time()
+        self.checkin_cutoff = datetime.strptime(self.schedule['checkin_cutoff'], '%H:%M:%S').time()
+        self.checkout_start = datetime.strptime(self.schedule['checkout_start'], '%H:%M:%S').time()
+        self.camera_mode = None
+        self.checkout_auto_started_date = None
+        self.checkout_completed = False
+        self.deadline_time = self.checkin_cutoff
+        self.deadline_set = True
         self.admin_dialog = None
         self.current_table = None
 
         self.setup_ui()
+        self.start_btn.setEnabled(datetime.now().time() <= self.checkin_cutoff)
         self.setup_timers()
 
     def setup_ui(self):
@@ -1372,6 +1541,20 @@ class AttendanceSystemGUI(QMainWindow):
         """)
         self.start_btn.clicked.connect(self.start_recognition)
 
+        self.checkout_btn = QPushButton("↩ Start Check-out / Early Exit")
+        self.checkout_btn.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        self.checkout_btn.setMinimumHeight(50)
+        self.checkout_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {WARNING_ORANGE};
+                color: white;
+                border: none;
+                border-radius: 8px;
+            }}
+            QPushButton:hover {{ background-color: #E65C00; }}
+        """)
+        self.checkout_btn.clicked.connect(self.start_checkout_scan)
+
         self.stop_btn = QPushButton("⏹ Stop")
         self.stop_btn.setFont(QFont("Segoe UI", 11, QFont.Bold))
         self.stop_btn.setMinimumHeight(50)
@@ -1400,6 +1583,7 @@ class AttendanceSystemGUI(QMainWindow):
         self.admin_btn.clicked.connect(self.open_admin_panel)
 
         buttons_layout.addWidget(self.start_btn)
+        buttons_layout.addWidget(self.checkout_btn)
         buttons_layout.addWidget(self.stop_btn)
         buttons_layout.addWidget(self.admin_btn)
         main_layout.addLayout(buttons_layout)
@@ -1416,46 +1600,39 @@ class AttendanceSystemGUI(QMainWindow):
         self.clock_timer.start(1000)
 
     def is_deadline_passed(self):
-        if not self.deadline_set:
-            return False
-        return datetime.now().time() >= self.deadline_time
+        return datetime.now().time() > self.checkin_cutoff
 
     def get_time_remaining(self):
-        if not self.deadline_set:
-            return "No deadline"
-
         now = datetime.now()
-        deadline_datetime = datetime.combine(now.date(), self.deadline_time)
-
-        if now > deadline_datetime:
-            deadline_datetime = datetime.combine(now.date() + timedelta(days=1), self.deadline_time)
-
-        remaining = deadline_datetime - now
-        hours = remaining.seconds // 3600
-        minutes = (remaining.seconds % 3600) // 60
-        seconds = remaining.seconds % 60
-
+        cutoff_dt = datetime.combine(now.date(), self.checkin_cutoff)
+        if now >= cutoff_dt:
+            return "Check-in closed"
+        remaining = cutoff_dt - now
+        hours, remainder = divmod(int(remaining.total_seconds()), 3600)
+        minutes, seconds = divmod(remainder, 60)
         return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
     def update_clock(self):
         now = datetime.now()
         self.clock_label.setText(f"{now.strftime('%H:%M:%S')} - {now.strftime('%d/%m/%Y')}")
-
-        if self.deadline_set:
-            if self.is_deadline_passed():
-                self.countdown_label.setText("Deadline: CLOSED")
-                self.countdown_label.setStyleSheet(f"color: {ERROR_RED}; font-weight: bold;")
-                if self.camera_thread and self.camera_thread.running:
-                    self.stop_recognition()
-            else:
-                self.countdown_label.setText(f"Time Remaining: {self.get_time_remaining()}")
-                self.countdown_label.setStyleSheet(f"color: {SUCCESS_GREEN};")
+        if now.time() <= self.checkin_cutoff:
+            self.countdown_label.setText(f"Check-in closes in: {self.get_time_remaining()}")
+            self.countdown_label.setStyleSheet(f"color: {SUCCESS_GREEN};")
         else:
-            self.countdown_label.setText("No deadline set")
+            self.countdown_label.setText("Check-in closed | Check-out starts at " +
+                                         self.checkout_start.strftime('%H:%M'))
             self.countdown_label.setStyleSheet(f"color: {WARNING_ORANGE};")
-
+        if self.camera_thread and self.camera_thread.running and self.camera_mode == "checkin":
+            if now.time() > self.checkin_cutoff:
+                self.stop_recognition()
+        if (hasattr(self, 'start_btn') and self.start_btn is not None
+                and now.time() >= self.checkout_start
+                and self.checkout_auto_started_date != now.date()):
+            self.checkout_auto_started_date = now.date()
+            self.start_checkout_scan(silent=True)
         if now.second == 0:
             self.update_stats()
+
 
     def update_stats(self):
         # Check if UI elements are initialized
@@ -1492,70 +1669,42 @@ class AttendanceSystemGUI(QMainWindow):
             self.absent_label.setText(f"Absent: 0")
 
     def start_recognition(self):
-        if not self.deadline_set:
-            msg = QMessageBox(self)
-            msg.setWindowTitle("No Deadline")
-            msg.setText("Admin must set deadline first.")
-            msg.setStyleSheet(f"""
-                QMessageBox {{ background-color: {DARK_BG}; }}
-                QMessageBox QLabel {{ color: {TEXT_PRIMARY}; }}
-                QPushButton {{ 
-                    color: {TEXT_PRIMARY}; 
-                    background-color: {ACCENT_BLUE};
-                    border: none;
-                    border-radius: 3px;
-                    padding: 5px;
-                    min-width: 50px;
-                }}
-            """)
-            msg.exec_()
+        if datetime.now().time() > self.checkin_cutoff:
+            QMessageBox.information(self, "Check-in Closed",
+                "Check-in is closed after 9:30 AM. Evening check-out starts automatically at 6:00 PM.")
             return
+        self._start_camera_scan("checkin")
 
-        if self.is_deadline_passed():
-            msg = QMessageBox(self)
-            msg.setWindowTitle("Deadline Passed")
-            msg.setText("Cannot start - deadline passed.")
-            msg.setStyleSheet(f"""
-                QMessageBox {{ background-color: {DARK_BG}; }}
-                QMessageBox QLabel {{ color: {TEXT_PRIMARY}; }}
-                QPushButton {{ 
-                    color: {TEXT_PRIMARY}; 
-                    background-color: {ACCENT_BLUE};
-                    border: none;
-                    border-radius: 3px;
-                    padding: 5px;
-                    min-width: 50px;
-                }}
-            """)
-            msg.exec_()
+    def start_checkout_scan(self, silent=False):
+        pending_ids = self.db_helper.get_pending_checkouts(date.today())
+        if not pending_ids:
+            if not silent:
+                QMessageBox.information(self, "No Pending Check-outs",
+                                        "There are no employees waiting for check-out today.")
             return
+        if self.camera_thread and self.camera_thread.running:
+            if self.camera_mode == "checkout":
+                return
+            self.stop_recognition()
+        self._start_camera_scan("checkout", pending_ids=pending_ids)
 
-        self.session_daily_records = {}
-        employees = self.db_helper.get_all_employees()
-        today = date.today()
-
-        for emp in employees:
-            try:
-                cursor = self.db_helper.connection.cursor()
-                cursor.execute("""SELECT arrival_time FROM attendance 
-                               WHERE employee_id = %s AND attendance_date = %s""", 
-                             (emp['employee_id'], today))
-                result = cursor.fetchone()
-                cursor.close()
-                if result:
-                    self.session_daily_records[emp['employee_id']] = result[0]
-            except:
-                pass
-
-        self.camera_thread = InsightFaceCameraThread(self.extractor, self.embeddings_data, 
-                                                    self.session_daily_records)
+    def _start_camera_scan(self, mode, pending_ids=None):
+        if self.camera_thread and self.camera_thread.running:
+            return
+        self.camera_mode = mode
+        self.checkout_completed = False
+        eligible = pending_ids if mode == "checkout" else None
+        self.camera_thread = InsightFaceCameraThread(
+            self.extractor, self.embeddings_data, mode=mode, eligible_ids=eligible
+        )
         self.camera_thread.frame_ready.connect(self.update_frame)
         self.camera_thread.face_recognized.connect(self.record_attendance)
+        self.camera_thread.unknown_face.connect(self.show_unknown_person)
         self.camera_thread.start()
-
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
-        self.recognition_label.setText("Recognizing faces...")
+        self.recognition_label.setText("Scanning for check-ins..." if mode == "checkin" else
+                                       f"Evening check-out scan active | {len(eligible or [])} pending")
         self.recognition_label.setStyleSheet(f"color: {SUCCESS_GREEN}; padding: 10px;")
 
     def stop_recognition(self):
@@ -1564,16 +1713,18 @@ class AttendanceSystemGUI(QMainWindow):
             self.camera_thread = None
 
         self.update_camera_icon()
-        self.start_btn.setEnabled(True if not self.is_deadline_passed() else False)
+        self.camera_mode = None
+        self.start_btn.setEnabled(datetime.now().time() <= self.checkin_cutoff)
         self.stop_btn.setEnabled(False)
         self.recognition_label.setText("Camera Stopped")
         self.recognition_label.setStyleSheet(f"color: {ERROR_RED}; padding: 10px;")
 
     def update_frame(self, frame):
-        if self.is_deadline_passed():
+        if frame is None:
+            self.recognition_label.setText("Camera could not be opened. Check camera connection.")
+            self.recognition_label.setStyleSheet(f"color: {ERROR_RED}; padding: 10px;")
             self.stop_recognition()
             return
-
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb_frame.shape
         bytes_per_line = ch * w
@@ -1583,22 +1734,85 @@ class AttendanceSystemGUI(QMainWindow):
         self.camera_label.setPixmap(scaled)
 
     def record_attendance(self, employee_id, employee_name, similarity, face_info):
-        print(f"Face recognized: {employee_name} ({employee_id}) with similarity: {similarity:.3f}")
-        
-        if self.db_helper.record_attendance(employee_id):
-            arrival_time = datetime.now().strftime("%H:%M:%S")
-            self.recognition_label.setText(f"✓ Check-in Registered\n{employee_name}\n{arrival_time}")
-            self.recognition_label.setStyleSheet(f"color: {SUCCESS_GREEN}; padding: 10px; font-weight: bold; font-size: 14px;")
+        print(f"Face recognized: {employee_name} ({employee_id}) similarity={similarity:.3f}")
+        if self.camera_mode == "checkout":
+            result = self.db_helper.record_check_out(employee_id)
+            if result.get('ok'):
+                schedule = self.db_helper.get_attendance_schedule()
+                checkout_start = datetime.strptime(
+                    schedule.get('checkout_start', '18:00:00'), '%H:%M:%S'
+                ).time()
+                actual_checkout = datetime.strptime(result['time'], '%H:%M:%S').time()
+                departure_label = "EARLY DEPARTURE" if actual_checkout < checkout_start else "Check-out Registered"
+                message = (f"✓ {departure_label}\n{employee_name}\n"
+                           f"{result['time']} | Working: {result['duration']}")
+            else:
+                message = f"Check-out not saved: {result.get('reason', 'unknown')}"
+                if result.get('reason') == 'no_checkin':
+                    message = f"No check-in found for {employee_name}"
+        else:
+            if datetime.now().time() > self.checkin_cutoff:
+                message = "Check-in closed after 9:30 AM"
+            else:
+                result = self.db_helper.record_check_in(employee_id)
+                if result.get('ok'):
+                    message = (f"✓ {result['status'].upper()} Check-in\n"
+                               f"{employee_name}\n{result['time']}")
+                else:
+                    message = {
+                        'checkin_closed': "Check-in closed after 9:30 AM",
+                        'already_checked_in': f"{employee_name} already checked in",
+                        'unknown_employee': "UNKNOWN PERSON / NOT REGISTERED"
+                    }.get(result.get('reason'), "Attendance could not be saved")
+        color = SUCCESS_GREEN if message.startswith("✓") else WARNING_ORANGE
+        self.recognition_label.setText(message)
+        self.recognition_label.setStyleSheet(
+            f"color: {color}; padding: 10px; font-weight: bold; font-size: 14px;"
+        )
+        if self.status_timer:
+            self.status_timer.stop()
+        self.status_timer = QTimer()
+        self.status_timer.timeout.connect(self.clear_recognition)
+        self.status_timer.start(4000)
+        self.update_stats()
+        if self.current_table:
+            self.populate_table_data(self.current_table)
+        if self.camera_mode == "checkout":
+            remaining = self.db_helper.get_pending_checkouts(date.today())
+            if not remaining:
+                # Keep camera preview live after the scan completes; recognition is disabled
+                # for further check-outs by clearing the eligible employee IDs.
+                self.checkout_completed = True
+                if self.camera_thread:
+                    self.camera_thread.eligible_ids = set()
+                self.recognition_label.setText(
+                    f"✓ All check-outs completed for today\nLast: {employee_name} | {result['time']}"
+                )
+                self.recognition_label.setStyleSheet(
+                    f"color: {SUCCESS_GREEN}; padding: 10px; font-weight: bold; font-size: 14px;"
+                )
+                if self.status_timer:
+                    self.status_timer.stop()
+            elif self.camera_thread:
+                self.camera_thread.eligible_ids = set(remaining)
 
-            if self.status_timer:
-                self.status_timer.stop()
-            self.status_timer = QTimer()
-            self.status_timer.timeout.connect(self.clear_recognition)
-            self.status_timer.start(3000)
-            self.update_stats()
+
+    def show_unknown_person(self):
+        self.recognition_label.setText("UNKNOWN PERSON / NOT REGISTERED")
+        self.recognition_label.setStyleSheet(
+            f"color: {WARNING_ORANGE}; padding: 10px; font-weight: bold; font-size: 14px;"
+        )
+        if self.status_timer:
+            self.status_timer.stop()
+        self.status_timer = QTimer()
+        self.status_timer.timeout.connect(self.clear_recognition)
+        self.status_timer.start(2500)
 
     def clear_recognition(self):
-        self.recognition_label.setText("Recognizing faces...")
+        if self.checkout_completed and self.camera_mode == "checkout":
+            self.recognition_label.setText("✓ All check-outs completed for today | Camera live")
+        else:
+            self.recognition_label.setText("Recognizing faces...")
         self.recognition_label.setStyleSheet(f"color: {SUCCESS_GREEN}; padding: 10px;")
         if self.status_timer:
             self.status_timer.stop()
@@ -1691,10 +1905,41 @@ class AttendanceSystemGUI(QMainWindow):
         """)
         deadline_btn.clicked.connect(self.open_deadline_settings)
 
+        payroll_btn = QPushButton("📊 Monthly Payroll")
+        payroll_btn.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        payroll_btn.setMinimumHeight(45)
+        payroll_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {ACCENT_BLUE};
+                color: white;
+                border: none;
+                border-radius: 8px;
+            }}
+            QPushButton:hover {{ background-color: {ACCENT_BLUE_HOVER}; }}
+        """)
+        payroll_btn.clicked.connect(self.open_monthly_payroll)
+
+        manual_btn = QPushButton("✍ Manual Attendance")
+        manual_btn.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        manual_btn.setMinimumHeight(45)
+        manual_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {SUCCESS_GREEN};
+                color: white;
+                border: none;
+                border-radius: 8px;
+            }}
+            QPushButton:hover {{ background-color: #2A7F3B; }}
+        """)
+        manual_btn.clicked.connect(self.open_manual_attendance)
+
+
         buttons_layout.addWidget(add_btn)
         buttons_layout.addWidget(view_btn)
         buttons_layout.addWidget(delete_btn)
         buttons_layout.addWidget(deadline_btn)
+        buttons_layout.addWidget(payroll_btn)
+        buttons_layout.addWidget(manual_btn)
         layout.addLayout(buttons_layout)
 
         search_layout = QHBoxLayout()
@@ -1747,8 +1992,11 @@ class AttendanceSystemGUI(QMainWindow):
         layout.addWidget(date_label)
 
         table = QTableWidget()
-        table.setColumnCount(5)
-        table.setHorizontalHeaderLabels(["Employee ID", "Name", "Arrival Time", "Status", "Select"])
+        table.setColumnCount(7)
+        table.setHorizontalHeaderLabels([
+            "Employee ID", "Name", "Check-in", "Check-out",
+            "Working Duration", "Status", "Select"
+        ])
         table.setStyleSheet(f"""
             QTableWidget {{
                 background-color: {DARK_SECONDARY};
@@ -1766,11 +2014,9 @@ class AttendanceSystemGUI(QMainWindow):
             }}
         """)
         table.horizontalHeader().setStretchLastSection(True)
-        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
-        table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        for column in range(6):
+            table.horizontalHeader().setSectionResizeMode(column, QHeaderView.Stretch)
+        table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
 
         self.current_table = table
         self.populate_table_data(table)
@@ -1856,128 +2102,48 @@ class AttendanceSystemGUI(QMainWindow):
         self.admin_dialog.exec_()
 
     def populate_table_data(self, table):
-        today = date.today()
-        employees = self.db_helper.get_all_employees()
+        records = self.db_helper.get_daily_attendance(date.today())
+        self._populate_attendance_rows(table, records)
 
-        rows = []
-        for emp in employees:
-            try:
-                cursor = self.db_helper.connection.cursor()
-                cursor.execute("""SELECT arrival_time FROM attendance 
-                               WHERE employee_id = %s AND attendance_date = %s""", 
-                             (emp['employee_id'], today))
-                result = cursor.fetchone()
-                cursor.close()
-
-                if not self.is_deadline_passed():
-                    if result:
-                        rows.append((emp['employee_id'], emp['employee_name'], str(result[0]), "Present"))
-                else:
-                    if result:
-                        rows.append((emp['employee_id'], emp['employee_name'], str(result[0]), "Present"))
-                    else:
-                        rows.append((emp['employee_id'], emp['employee_name'], "-", "Absent"))
-            except:
-                pass
-
-        table.setRowCount(len(rows))
-
-        for row, (emp_id, emp_name, time_str, status) in enumerate(rows):
-            table.setItem(row, 0, QTableWidgetItem(emp_id))
-            table.setItem(row, 1, QTableWidgetItem(emp_name))
-            table.setItem(row, 2, QTableWidgetItem(time_str))
-
-            status_item = QTableWidgetItem(status)
-            if status == "Present":
-                status_item.setBackground(QColor(49, 162, 76))
-            else:
-                status_item.setBackground(QColor(228, 22, 58))
-            table.setItem(row, 3, status_item)
-
+    def _populate_attendance_rows(self, table, records):
+        table.setRowCount(len(records))
+        for row, record in enumerate(records):
+            values = [
+                record['employee_id'], record['employee_name'],
+                record['arrival_time'], record['departure_time'],
+                record['working_duration'], record['status']
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                if column == 5:
+                    if value == "PRESENT":
+                        item.setBackground(QColor(49, 162, 76))
+                    elif value == "LATE":
+                        item.setBackground(QColor(245, 124, 0))
+                    elif value == "ABSENT":
+                        item.setBackground(QColor(228, 22, 58))
+                table.setItem(row, column, item)
             checkbox = QCheckBox()
-            checkbox.setProperty("employee_id", emp_id)
-            table.setCellWidget(row, 4, checkbox)
+            checkbox.setProperty("employee_id", record['employee_id'])
+            table.setCellWidget(row, 6, checkbox)
 
     def update_admin_stats(self, table, present_label, absent_label):
-        today = date.today()
-        employees = self.db_helper.get_all_employees()
-
-        present_count = 0
-        absent_count = 0
-
-        for emp in employees:
-            try:
-                cursor = self.db_helper.connection.cursor()
-                cursor.execute("""SELECT arrival_time FROM attendance 
-                               WHERE employee_id = %s AND attendance_date = %s""", 
-                             (emp['employee_id'], today))
-                result = cursor.fetchone()
-                cursor.close()
-
-                if result:
-                    present_count += 1
-                else:
-                    if self.is_deadline_passed():
-                        absent_count += 1
-            except:
-                pass
-
+        records = self.db_helper.get_daily_attendance(date.today())
+        present_count = sum(1 for row in records if row['status'] in ("PRESENT", "LATE"))
+        absent_count = sum(1 for row in records if row['status'] == "ABSENT")
         present_label.setText(f"Present: {present_count}")
-        if self.is_deadline_passed():
-            absent_label.setText(f"Absent: {absent_count}")
-        else:
-            absent_label.setText(f"Absent: 0")
+        absent_label.setText(f"Absent: {absent_count}")
 
     def search_attendance_records(self, table, search_input):
         search_text = search_input.text().lower().strip()
-        if not search_text:
-            self.populate_table_data(table)
-            return
-
-        today = date.today()
-        employees = self.db_helper.get_all_employees()
-
-        rows = []
-        for emp in employees:
-            if search_text not in emp['employee_name'].lower() and search_text not in emp['employee_id'].lower():
-                continue
-
-            try:
-                cursor = self.db_helper.connection.cursor()
-                cursor.execute("""SELECT arrival_time FROM attendance 
-                               WHERE employee_id = %s AND attendance_date = %s""", 
-                             (emp['employee_id'], today))
-                result = cursor.fetchone()
-                cursor.close()
-
-                if not self.is_deadline_passed():
-                    if result:
-                        rows.append((emp['employee_id'], emp['employee_name'], str(result[0]), "Present"))
-                else:
-                    if result:
-                        rows.append((emp['employee_id'], emp['employee_name'], str(result[0]), "Present"))
-                    else:
-                        rows.append((emp['employee_id'], emp['employee_name'], "-", "Absent"))
-            except:
-                pass
-
-        table.setRowCount(len(rows))
-
-        for row, (emp_id, emp_name, time_str, status) in enumerate(rows):
-            table.setItem(row, 0, QTableWidgetItem(emp_id))
-            table.setItem(row, 1, QTableWidgetItem(emp_name))
-            table.setItem(row, 2, QTableWidgetItem(time_str))
-
-            status_item = QTableWidgetItem(status)
-            if status == "Present":
-                status_item.setBackground(QColor(49, 162, 76))
-            else:
-                status_item.setBackground(QColor(228, 22, 58))
-            table.setItem(row, 3, status_item)
-
-            checkbox = QCheckBox()
-            checkbox.setProperty("employee_id", emp_id)
-            table.setCellWidget(row, 4, checkbox)
+        records = self.db_helper.get_daily_attendance(date.today())
+        if search_text:
+            records = [
+                row for row in records
+                if search_text in row['employee_name'].lower()
+                or search_text in row['employee_id'].lower()
+            ]
+        self._populate_attendance_rows(table, records)
 
     def clear_search_attendance(self, table, search_input):
         search_input.clear()
@@ -1991,7 +2157,7 @@ class AttendanceSystemGUI(QMainWindow):
         employee_names = []
         
         for row in range(self.current_table.rowCount()):
-            checkbox = self.current_table.cellWidget(row, 4)
+            checkbox = self.current_table.cellWidget(row, 6)
             if checkbox and checkbox.isChecked():
                 emp_id = self.current_table.item(row, 0).text()
                 emp_name = self.current_table.item(row, 1).text()
@@ -2125,9 +2291,10 @@ class AttendanceSystemGUI(QMainWindow):
             self.db_helper.connection.commit()
             cursor.close()
         
-            self.deadline_set = False
-            self.deadline_time = time(12, 0)
-            self.start_btn.setEnabled(False)
+            # Clearing today's attendance must not reset the saved office schedule.
+            self.deadline_set = True
+            self.deadline_time = self.checkin_cutoff
+            self.start_btn.setEnabled(datetime.now().time() <= self.checkin_cutoff)
         
             self.update_clock()
             self.update_stats()
@@ -2207,80 +2374,147 @@ class AttendanceSystemGUI(QMainWindow):
         dialog.exec_()
 
     def open_deadline_settings(self):
-        dialog = DeadlineSettingsDialog(self.admin_dialog, self.deadline_time)
+        dialog = DeadlineSettingsDialog(self.admin_dialog, self.checkin_cutoff)
         if dialog.exec_() == QDialog.Accepted:
-            self.deadline_time = dialog.deadline_time
+            new_cutoff = dialog.deadline_time
+            if new_cutoff <= self.checkin_time:
+                QMessageBox.warning(
+                    self.admin_dialog, "Invalid Check-in Cutoff",
+                    "The check-in closing time must be later than the 9:00 AM on-time threshold."
+                )
+                return
+            if not self.db_helper.save_checkin_cutoff(new_cutoff.strftime('%H:%M:%S')):
+                QMessageBox.critical(
+                    self.admin_dialog, "Schedule Save Failed",
+                    "Could not save the check-in cutoff to the database."
+                )
+                return
+            self.checkin_cutoff = new_cutoff
+            self.deadline_time = new_cutoff
             self.deadline_set = True
-            self.start_btn.setEnabled(True)
+            self.start_btn.setEnabled(datetime.now().time() <= self.checkin_cutoff)
             self.update_clock()
             self.update_stats()
 
-    def export_to_csv(self):
-        file_path, _ = QFileDialog.getSaveFileName(
-            self.admin_dialog, "Save Report", f"attendance_{date.today()}.csv", "CSV Files (*.csv)"
-        )
-
-        if not file_path:
+    def open_manual_attendance(self):
+        """Allow an administrator to record today's attendance when the camera/check-in window is unavailable."""
+        employees = self.db_helper.get_all_employees()
+        if not employees:
+            QMessageBox.information(self, "Manual Attendance", "No active employees were found.")
             return
 
-        try:
-            employees = self.db_helper.get_all_employees()
-            today = date.today()
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Manual Attendance")
+        dialog.setMinimumWidth(430)
+        dialog.setStyleSheet(f"""
+            QDialog {{ background-color: {DARK_BG}; }}
+            QLabel {{ color: {TEXT_PRIMARY}; }}
+            QComboBox, QTimeEdit {{
+                background-color: {DARK_SECONDARY};
+                color: {TEXT_PRIMARY};
+                border: 1px solid {DARK_TERTIARY};
+                border-radius: 5px;
+                padding: 8px;
+                min-height: 28px;
+            }}
+        """)
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(12)
+        heading = QLabel("Record today's attendance")
+        heading.setFont(QFont("Segoe UI", 13, QFont.Bold))
+        layout.addWidget(heading)
 
+        date_label = QLabel(f"Attendance date: {date.today().strftime('%d/%m/%Y')}")
+        layout.addWidget(date_label)
+
+        employee_label = QLabel("Select employee:")
+        layout.addWidget(employee_label)
+        employee_combo = QComboBox()
+        for employee in employees:
+            employee_id = employee.get('employee_id')
+            employee_name = employee.get('employee_name', 'Unknown')
+            employee_combo.addItem(f"{employee_name} ({employee_id})", employee_id)
+        layout.addWidget(employee_combo)
+
+        time_label = QLabel("Actual check-in time:")
+        layout.addWidget(time_label)
+        arrival_edit = QTimeEdit()
+        arrival_edit.setDisplayFormat("hh:mm AP")
+        arrival_edit.setTime(QTime.currentTime())
+        layout.addWidget(arrival_edit)
+
+        note = QLabel("Manual entry is allowed after the normal camera check-in cutoff. Late status is calculated from the saved office schedule.")
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color: {TEXT_SECONDARY};")
+        layout.addWidget(note)
+
+        buttons = QHBoxLayout()
+        save_btn = QPushButton("Save Attendance")
+        save_btn.setStyleSheet(f"background-color: {SUCCESS_GREEN}; color: white; padding: 10px;")
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setStyleSheet(f"background-color: {DARK_TERTIARY}; color: white; padding: 10px;")
+        buttons.addWidget(save_btn)
+        buttons.addWidget(cancel_btn)
+        layout.addLayout(buttons)
+        cancel_btn.clicked.connect(dialog.reject)
+
+        def save_manual_record():
+            employee_id = employee_combo.currentData()
+            qt_time = arrival_edit.time()
+            result = self.db_helper.record_manual_check_in(
+                employee_id, datetime.combine(date.today(), time(qt_time.hour(), qt_time.minute(), qt_time.second()))
+            )
+            if not result.get('ok'):
+                messages = {
+                    'already_checked_in': "Attendance has already been recorded for this employee today.",
+                    'unknown_employee': "The selected employee is no longer active.",
+                    'database_error': "Database error. Please check the application log and try again."
+                }
+                QMessageBox.warning(dialog, "Attendance Not Saved",
+                                    messages.get(result.get('reason'), "Attendance could not be saved."))
+                return
+            dialog.accept()
+            self.update_stats()
+            if hasattr(self, 'current_table') and self.current_table:
+                self.populate_table_data(self.current_table)
+            QMessageBox.information(
+                self, "Attendance Saved",
+                f"Manual attendance recorded for {employee_combo.currentText()}\\n"
+                f"Check-in: {result.get('time')}\\nStatus: {result.get('status', '').upper()}"
+            )
+
+        save_btn.clicked.connect(save_manual_record)
+        dialog.exec_()
+
+    def open_monthly_payroll(self):
+        dialog = MonthlyPayrollDialog(self.admin_dialog, self.db_helper)
+        dialog.exec_()
+
+    def export_to_csv(self):
+        file_path, _ = QFileDialog.getSaveFileName(
+            self.admin_dialog, "Save Report",
+            f"attendance_{date.today()}.csv", "CSV Files (*.csv)"
+        )
+        if not file_path:
+            return
+        try:
+            records = self.db_helper.get_daily_attendance(date.today())
             with open(file_path, 'w', newline='', encoding='utf-8-sig') as f:
                 writer = csv.writer(f)
-                writer.writerow(["Employee ID", "Name", "Arrival Time", "Status"])
-
-                for emp in employees:
-                    try:
-                        cursor = self.db_helper.connection.cursor()
-                        cursor.execute("""SELECT arrival_time FROM attendance 
-                                       WHERE employee_id = %s AND attendance_date = %s""", 
-                                     (emp['employee_id'], today))
-                        result = cursor.fetchone()
-                        cursor.close()
-
-                        if result:
-                            writer.writerow([emp['employee_id'], emp['employee_name'], str(result[0]), "Present"])
-                        else:
-                            if self.is_deadline_passed():
-                                writer.writerow([emp['employee_id'], emp['employee_name'], "-", "Absent"])
-                    except:
-                        pass
-
-            msg = QMessageBox(self.admin_dialog)
-            msg.setWindowTitle("Success")
-            msg.setText("Report exported successfully!")
-            msg.setStyleSheet(f"""
-                QMessageBox {{ background-color: {DARK_BG}; }}
-                QMessageBox QLabel {{ color: {TEXT_PRIMARY}; }}
-                QPushButton {{ 
-                    color: {TEXT_PRIMARY}; 
-                    background-color: {ACCENT_BLUE};
-                    border: none;
-                    border-radius: 3px;
-                    padding: 5px;
-                    min-width: 50px;
-                }}
-            """)
-            msg.exec_()
+                writer.writerow([
+                    "Employee ID", "Name", "Check-in", "Check-out",
+                    "Working Duration", "Status"
+                ])
+                for record in records:
+                    writer.writerow([
+                        record['employee_id'], record['employee_name'],
+                        record['arrival_time'], record['departure_time'],
+                        record['working_duration'], record['status']
+                    ])
+            QMessageBox.information(self.admin_dialog, "Success",
+                                    "Attendance report exported successfully.")
         except Exception as e:
-            msg = QMessageBox(self.admin_dialog)
-            msg.setWindowTitle("Error")
-            msg.setText(str(e))
-            msg.setStyleSheet(f"""
-                QMessageBox {{ background-color: {DARK_BG}; }}
-                QMessageBox QLabel {{ color: {TEXT_PRIMARY}; }}
-                QPushButton {{ 
-                    color: {TEXT_PRIMARY}; 
-                    background-color: {ACCENT_BLUE};
-                    border: none;
-                    border-radius: 3px;
-                    padding: 5px;
-                    min-width: 50px;
-                }}
-            """)
-            msg.exec_()
+            QMessageBox.critical(self.admin_dialog, "Export Error", str(e))
 
     def closeEvent(self, event):
         if self.camera_thread:
