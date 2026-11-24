@@ -18,6 +18,7 @@ import cv2
 import numpy as np
 from database_helper import DatabaseHelper
 from insightface_embeddings import InsightFaceEmbeddingExtractor
+from monthly_payroll import MonthlyPayrollDialog
 
 DARK_BG = "#18191A"
 DARK_SECONDARY = "#242526"
@@ -1388,6 +1389,7 @@ class AttendanceSystemGUI(QMainWindow):
         self.camera_label = None
         self.recognition_label = None
         self.start_btn = None
+        self.checkout_btn = None
         self.stop_btn = None
         self.admin_btn = None
 
@@ -1539,6 +1541,20 @@ class AttendanceSystemGUI(QMainWindow):
         """)
         self.start_btn.clicked.connect(self.start_recognition)
 
+        self.checkout_btn = QPushButton("↩ Start Check-out / Early Exit")
+        self.checkout_btn.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        self.checkout_btn.setMinimumHeight(50)
+        self.checkout_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {WARNING_ORANGE};
+                color: white;
+                border: none;
+                border-radius: 8px;
+            }}
+            QPushButton:hover {{ background-color: #E65C00; }}
+        """)
+        self.checkout_btn.clicked.connect(self.start_checkout_scan)
+
         self.stop_btn = QPushButton("⏹ Stop")
         self.stop_btn.setFont(QFont("Segoe UI", 11, QFont.Bold))
         self.stop_btn.setMinimumHeight(50)
@@ -1567,6 +1583,7 @@ class AttendanceSystemGUI(QMainWindow):
         self.admin_btn.clicked.connect(self.open_admin_panel)
 
         buttons_layout.addWidget(self.start_btn)
+        buttons_layout.addWidget(self.checkout_btn)
         buttons_layout.addWidget(self.stop_btn)
         buttons_layout.addWidget(self.admin_btn)
         main_layout.addLayout(buttons_layout)
@@ -1882,10 +1899,25 @@ class AttendanceSystemGUI(QMainWindow):
         """)
         deadline_btn.clicked.connect(self.open_deadline_settings)
 
+        payroll_btn = QPushButton("📊 Monthly Payroll")
+        payroll_btn.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        payroll_btn.setMinimumHeight(45)
+        payroll_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {ACCENT_BLUE};
+                color: white;
+                border: none;
+                border-radius: 8px;
+            }}
+            QPushButton:hover {{ background-color: {ACCENT_BLUE_HOVER}; }}
+        """)
+        payroll_btn.clicked.connect(self.open_monthly_payroll)
+
         buttons_layout.addWidget(add_btn)
         buttons_layout.addWidget(view_btn)
         buttons_layout.addWidget(delete_btn)
         buttons_layout.addWidget(deadline_btn)
+        buttons_layout.addWidget(payroll_btn)
         layout.addLayout(buttons_layout)
 
         search_layout = QHBoxLayout()
@@ -2341,6 +2373,10 @@ class AttendanceSystemGUI(QMainWindow):
             self.start_btn.setEnabled(datetime.now().time() <= self.checkin_cutoff)
             self.update_clock()
             self.update_stats()
+
+    def open_monthly_payroll(self):
+        dialog = MonthlyPayrollDialog(self.admin_dialog, self.db_helper)
+        dialog.exec_()
 
     def export_to_csv(self):
         file_path, _ = QFileDialog.getSaveFileName(
