@@ -2479,7 +2479,7 @@ class AttendanceSystemGUI(QMainWindow):
                 self.populate_table_data(self.current_table)
             QMessageBox.information(
                 self, "Attendance Saved",
-                f"Manual attendance recorded for {employee_combo.currentText()}\\n"
+                f"Manual attendance recorded for {employee_combo.currentText()}\n"
                 f"Check-in: {result.get('time')}\\nStatus: {result.get('status', '').upper()}"
             )
 
