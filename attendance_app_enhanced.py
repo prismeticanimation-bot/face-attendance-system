@@ -135,17 +135,47 @@ class InsightFaceCameraThread(QThread):
         self.emitted_ids = set()
         self.unknown_notified = False
 
+    def _open_camera(self):
+        """Try common Windows camera backends and DroidCam virtual-camera indices."""
+        backends = []
+        for backend_name in ("CAP_MSMF", "CAP_DSHOW", "CAP_ANY"):
+            backend = getattr(cv2, backend_name, None)
+            if backend is not None and backend not in backends:
+                backends.append(backend)
+
+        # Try the default camera first, then other virtual-camera indices.
+        for index in range(4):
+            for backend in backends:
+                camera = cv2.VideoCapture(index, backend)
+                if camera.isOpened():
+                    camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    ok, test_frame = camera.read()
+                    if ok and test_frame is not None:
+                        print(f"Attendance camera opened: index={index}, backend={backend}")
+                        return camera
+                camera.release()
+        return None
+
     def run(self):
-        self.camera = cv2.VideoCapture(0, cv2.CAP_MSMF)
-        self.running = True
-        if not self.camera.isOpened():
+        self.camera = self._open_camera()
+        if self.camera is None:
             self.running = False
             self.frame_ready.emit(None)
             return
+
+        self.running = True
+        failed_reads = 0
         while self.running:
             ret, frame = self.camera.read()
-            if not ret:
+            if not ret or frame is None:
+                failed_reads += 1
+                if failed_reads >= 30:
+                    self.running = False
+                    self.frame_ready.emit(None)
+                    break
+                self.msleep(20)
                 continue
+            failed_reads = 0
             employee_id, similarity, employee_name, face_info = (
                 self.extractor.recognize_face_from_embedding(frame, self.embeddings_data)
             )
@@ -162,6 +192,7 @@ class InsightFaceCameraThread(QThread):
             elif face_info is None:
                 self.unknown_notified = False
             self.frame_ready.emit(frame)
+
         if self.camera:
             self.camera.release()
             self.camera = None
@@ -1635,38 +1666,36 @@ class AttendanceSystemGUI(QMainWindow):
 
 
     def update_stats(self):
-        # Check if UI elements are initialized
+        """Refresh the main-screen totals directly from today's saved attendance."""
         if not hasattr(self, 'present_label') or self.present_label is None:
             return
-            
-        employees = self.db_helper.get_all_employees()
-        today = date.today()
 
-        present_count = 0
-        absent_count = 0
+        cursor = None
+        try:
+            today = date.today()
+            cursor = self.db_helper.connection.cursor()
+            cursor.execute(
+                "SELECT COUNT(DISTINCT employee_id) FROM attendance "
+                "WHERE attendance_date = %s AND arrival_time IS NOT NULL",
+                (today,)
+            )
+            row = cursor.fetchone()
+            present_count = int(row[0] or 0) if row else 0
 
-        for emp in employees:
-            try:
-                cursor = self.db_helper.connection.cursor()
-                cursor.execute("""SELECT arrival_time FROM attendance 
-                               WHERE employee_id = %s AND attendance_date = %s""", 
-                             (emp['employee_id'], today))
-                result = cursor.fetchone()
-                cursor.close()
+            cursor.execute(
+                "SELECT COUNT(*) FROM employees WHERE is_active = TRUE"
+            )
+            row = cursor.fetchone()
+            active_count = int(row[0] or 0) if row else 0
 
-                if result:
-                    present_count += 1
-                else:
-                    if self.is_deadline_passed():
-                        absent_count += 1
-            except:
-                pass
-
-        self.present_label.setText(f"Present: {present_count}")
-        if self.is_deadline_passed():
+            absent_count = max(0, active_count - present_count) if self.is_deadline_passed() else 0
+            self.present_label.setText(f"Present: {present_count}")
             self.absent_label.setText(f"Absent: {absent_count}")
-        else:
-            self.absent_label.setText(f"Absent: 0")
+        except Exception as e:
+            print(f"Could not refresh attendance totals: {e}")
+        finally:
+            if cursor:
+                cursor.close()
 
     def start_recognition(self):
         if datetime.now().time() > self.checkin_cutoff:
@@ -1682,15 +1711,24 @@ class AttendanceSystemGUI(QMainWindow):
                 QMessageBox.information(self, "No Pending Check-outs",
                                         "There are no employees waiting for check-out today.")
             return
-        if self.camera_thread and self.camera_thread.running:
-            if self.camera_mode == "checkout":
+
+        if self.camera_thread and self.camera_thread.isRunning():
+            if self.camera_mode == "checkout" and self.camera_thread.running:
+                # Refresh the eligible list in case manual attendance was just added.
+                self.camera_thread.eligible_ids = set(pending_ids)
                 return
             self.stop_recognition()
+        elif self.camera_thread:
+            self.camera_thread.wait()
+            self.camera_thread = None
+            self.camera_mode = None
+
         self._start_camera_scan("checkout", pending_ids=pending_ids)
 
     def _start_camera_scan(self, mode, pending_ids=None):
-        if self.camera_thread and self.camera_thread.running:
-            return
+        if self.camera_thread and self.camera_thread.isRunning():
+            self.camera_thread.stop()
+            self.camera_thread = None
         self.camera_mode = mode
         self.checkout_completed = False
         eligible = pending_ids if mode == "checkout" else None
@@ -1707,7 +1745,7 @@ class AttendanceSystemGUI(QMainWindow):
                                        f"Evening check-out scan active | {len(eligible or [])} pending")
         self.recognition_label.setStyleSheet(f"color: {SUCCESS_GREEN}; padding: 10px;")
 
-    def stop_recognition(self):
+    def stop_recognition(self, status_text="Camera Stopped"):
         if self.camera_thread:
             self.camera_thread.stop()
             self.camera_thread = None
@@ -1716,14 +1754,15 @@ class AttendanceSystemGUI(QMainWindow):
         self.camera_mode = None
         self.start_btn.setEnabled(datetime.now().time() <= self.checkin_cutoff)
         self.stop_btn.setEnabled(False)
-        self.recognition_label.setText("Camera Stopped")
+        self.recognition_label.setText(status_text)
         self.recognition_label.setStyleSheet(f"color: {ERROR_RED}; padding: 10px;")
 
     def update_frame(self, frame):
         if frame is None:
-            self.recognition_label.setText("Camera could not be opened. Check camera connection.")
-            self.recognition_label.setStyleSheet(f"color: {ERROR_RED}; padding: 10px;")
-            self.stop_recognition()
+            self.stop_recognition(
+                "Camera could not be opened. Check that DroidCam is connected, "
+                "its virtual camera is enabled, and no other app is using it."
+            )
             return
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb_frame.shape
