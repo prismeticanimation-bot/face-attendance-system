@@ -148,6 +148,53 @@ class DatabaseHelper:
             if cursor:
                 cursor.close()
 
+    def record_manual_check_in(self, employee_id, checkin_at=None):
+        """Admin override: record today's attendance even after the camera check-in cutoff."""
+        cursor = None
+        try:
+            checkin_at = checkin_at or datetime.now()
+            today = checkin_at.date()
+            checkin_time = checkin_at.time().replace(microsecond=0)
+            schedule = self.get_attendance_schedule()
+            scheduled_start = datetime.strptime(
+                schedule['checkin_time'], '%H:%M:%S'
+            ).time()
+            status = 'present' if checkin_time <= scheduled_start else 'late'
+
+            cursor = self.connection.cursor()
+            cursor.execute(
+                "SELECT employee_name FROM employees "
+                "WHERE employee_id = %s AND is_active = TRUE", (employee_id,)
+            )
+            employee = cursor.fetchone()
+            if not employee:
+                return {'ok': False, 'reason': 'unknown_employee'}
+
+            cursor.execute(
+                "SELECT arrival_time FROM attendance "
+                "WHERE employee_id = %s AND attendance_date = %s",
+                (employee_id, today)
+            )
+            if cursor.fetchone():
+                return {'ok': False, 'reason': 'already_checked_in'}
+
+            cursor.execute(
+                "INSERT INTO attendance "
+                "(employee_id, employee_name, attendance_date, arrival_time, status) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (employee_id, employee[0], today, checkin_time, status)
+            )
+            self.connection.commit()
+            return {'ok': True, 'status': status, 'time': str(checkin_time)}
+        except Error as e:
+            if self.connection:
+                self.connection.rollback()
+            print(f"Error recording manual check-in: {e}")
+            return {'ok': False, 'reason': 'database_error'}
+        finally:
+            if cursor:
+                cursor.close()
+
     def record_check_in(self, employee_id, checkin_at=None):
         """Insert exactly one check-in per employee/day; never overwrite an existing one."""
         cursor = None
