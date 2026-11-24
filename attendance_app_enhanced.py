@@ -1738,7 +1738,13 @@ class AttendanceSystemGUI(QMainWindow):
         if self.camera_mode == "checkout":
             result = self.db_helper.record_check_out(employee_id)
             if result.get('ok'):
-                message = (f"✓ Check-out Registered\n{employee_name}\n"
+                schedule = self.db_helper.get_attendance_schedule()
+                checkout_start = datetime.strptime(
+                    schedule.get('checkout_start', '18:00:00'), '%H:%M:%S'
+                ).time()
+                actual_checkout = datetime.strptime(result['time'], '%H:%M:%S').time()
+                departure_label = "EARLY DEPARTURE" if actual_checkout < checkout_start else "Check-out Registered"
+                message = (f"✓ {departure_label}\n{employee_name}\n"
                            f"{result['time']} | Working: {result['duration']}")
             else:
                 message = f"Check-out not saved: {result.get('reason', 'unknown')}"
