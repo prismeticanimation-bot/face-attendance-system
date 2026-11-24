@@ -2033,6 +2033,38 @@ class AttendanceSystemGUI(QMainWindow):
         date_label.setStyleSheet(f"color: {TEXT_SECONDARY};")
         layout.addWidget(date_label)
 
+        employee_filter_layout = QHBoxLayout()
+        employee_filter_label = QLabel("Select Employee:")
+        employee_filter_label.setStyleSheet(f"color: {TEXT_PRIMARY};")
+        employee_combo = QComboBox()
+        employee_combo.setFont(QFont("Segoe UI", 10))
+        employee_combo.setMinimumHeight(36)
+        employee_combo.setStyleSheet(f"""
+            QComboBox {{
+                background-color: {DARK_SECONDARY};
+                color: {TEXT_PRIMARY};
+                border: 2px solid {DARK_TERTIARY};
+                border-radius: 8px;
+                padding: 6px;
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: {DARK_SECONDARY};
+                color: {TEXT_PRIMARY};
+                selection-background-color: {ACCENT_BLUE};
+            }}
+        """)
+        employee_combo.addItem("Select Employee", None)
+        for employee in self.db_helper.get_all_employees():
+            employee_combo.addItem(
+                f"{employee['employee_name']} ({employee['employee_id']})",
+                employee['employee_id']
+            )
+        if employee_combo.count() > 1:
+            employee_combo.setCurrentIndex(1)
+        employee_filter_layout.addWidget(employee_filter_label)
+        employee_filter_layout.addWidget(employee_combo, 1)
+        layout.addLayout(employee_filter_layout)
+
         table = QTableWidget()
         table.setColumnCount(7)
         table.setHorizontalHeaderLabels([
@@ -2061,7 +2093,11 @@ class AttendanceSystemGUI(QMainWindow):
         table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
 
         self.current_table = table
-        self.populate_table_data(table)
+        self.daily_employee_combo = employee_combo
+        employee_combo.currentIndexChanged.connect(
+            lambda: self.search_attendance_records(table, search_input)
+        )
+        self.populate_table_data(table, employee_combo.currentData())
         layout.addWidget(table, 1)
 
         stats_layout = QHBoxLayout()
@@ -2143,8 +2179,10 @@ class AttendanceSystemGUI(QMainWindow):
         self.admin_dialog.setLayout(layout)
         self.admin_dialog.exec_()
 
-    def populate_table_data(self, table):
+    def populate_table_data(self, table, employee_id=None):
         records = self.db_helper.get_daily_attendance(date.today())
+        if employee_id:
+            records = [row for row in records if row['employee_id'] == employee_id]
         self._populate_attendance_rows(table, records)
 
     def _populate_attendance_rows(self, table, records):
@@ -2179,6 +2217,13 @@ class AttendanceSystemGUI(QMainWindow):
     def search_attendance_records(self, table, search_input):
         search_text = search_input.text().lower().strip()
         records = self.db_helper.get_daily_attendance(date.today())
+
+        employee_id = None
+        if hasattr(self, 'daily_employee_combo') and self.daily_employee_combo:
+            employee_id = self.daily_employee_combo.currentData()
+        if employee_id:
+            records = [row for row in records if row['employee_id'] == employee_id]
+
         if search_text:
             records = [
                 row for row in records
@@ -2189,7 +2234,7 @@ class AttendanceSystemGUI(QMainWindow):
 
     def clear_search_attendance(self, table, search_input):
         search_input.clear()
-        self.populate_table_data(table)
+        self.search_attendance_records(table, search_input)
 
     def delete_selected_records(self):
         if not self.current_table:
