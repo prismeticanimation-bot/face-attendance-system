@@ -11,7 +11,7 @@ from datetime import date, datetime, time, timedelta
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QLabel, QLineEdit, QDialog, QFileDialog, QMessageBox, 
                              QTableWidget, QTableWidgetItem, QGroupBox, QFormLayout, QTimeEdit,
-                             QCheckBox, QListWidget, QListWidgetItem, QScrollArea, QHeaderView)
+                             QCheckBox, QListWidget, QListWidgetItem, QScrollArea, QHeaderView, QComboBox)
 from PyQt5.QtCore import QTimer, Qt, QThread, pyqtSignal, QTime, QSize, QRect
 from PyQt5.QtGui import QImage, QPixmap, QFont, QColor, QIcon, QPainter, QBrush
 import cv2
@@ -1919,11 +1919,27 @@ class AttendanceSystemGUI(QMainWindow):
         """)
         payroll_btn.clicked.connect(self.open_monthly_payroll)
 
+        manual_btn = QPushButton("✍ Manual Attendance")
+        manual_btn.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        manual_btn.setMinimumHeight(45)
+        manual_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {SUCCESS_GREEN};
+                color: white;
+                border: none;
+                border-radius: 8px;
+            }}
+            QPushButton:hover {{ background-color: #2A7F3B; }}
+        """)
+        manual_btn.clicked.connect(self.open_manual_attendance)
+
+
         buttons_layout.addWidget(add_btn)
         buttons_layout.addWidget(view_btn)
         buttons_layout.addWidget(delete_btn)
         buttons_layout.addWidget(deadline_btn)
         buttons_layout.addWidget(payroll_btn)
+        buttons_layout.addWidget(manual_btn)
         layout.addLayout(buttons_layout)
 
         search_layout = QHBoxLayout()
@@ -2379,6 +2395,96 @@ class AttendanceSystemGUI(QMainWindow):
             self.start_btn.setEnabled(datetime.now().time() <= self.checkin_cutoff)
             self.update_clock()
             self.update_stats()
+
+    def open_manual_attendance(self):
+        """Allow an administrator to record today's attendance when the camera/check-in window is unavailable."""
+        employees = self.db_helper.get_all_employees()
+        if not employees:
+            QMessageBox.information(self, "Manual Attendance", "No active employees were found.")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Manual Attendance")
+        dialog.setMinimumWidth(430)
+        dialog.setStyleSheet(f"""
+            QDialog {{ background-color: {DARK_BG}; }}
+            QLabel {{ color: {TEXT_PRIMARY}; }}
+            QComboBox, QTimeEdit {{
+                background-color: {DARK_SECONDARY};
+                color: {TEXT_PRIMARY};
+                border: 1px solid {DARK_TERTIARY};
+                border-radius: 5px;
+                padding: 8px;
+                min-height: 28px;
+            }}
+        """)
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(12)
+        heading = QLabel("Record today's attendance")
+        heading.setFont(QFont("Segoe UI", 13, QFont.Bold))
+        layout.addWidget(heading)
+
+        date_label = QLabel(f"Attendance date: {date.today().strftime('%d/%m/%Y')}")
+        layout.addWidget(date_label)
+
+        employee_label = QLabel("Select employee:")
+        layout.addWidget(employee_label)
+        employee_combo = QComboBox()
+        for employee in employees:
+            employee_id = employee.get('employee_id')
+            employee_name = employee.get('employee_name', 'Unknown')
+            employee_combo.addItem(f"{employee_name} ({employee_id})", employee_id)
+        layout.addWidget(employee_combo)
+
+        time_label = QLabel("Actual check-in time:")
+        layout.addWidget(time_label)
+        arrival_edit = QTimeEdit()
+        arrival_edit.setDisplayFormat("hh:mm AP")
+        arrival_edit.setTime(QTime.currentTime())
+        layout.addWidget(arrival_edit)
+
+        note = QLabel("Manual entry is allowed after the normal camera check-in cutoff. Late status is calculated from the saved office schedule.")
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color: {TEXT_SECONDARY};")
+        layout.addWidget(note)
+
+        buttons = QHBoxLayout()
+        save_btn = QPushButton("Save Attendance")
+        save_btn.setStyleSheet(f"background-color: {SUCCESS_GREEN}; color: white; padding: 10px;")
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setStyleSheet(f"background-color: {DARK_TERTIARY}; color: white; padding: 10px;")
+        buttons.addWidget(save_btn)
+        buttons.addWidget(cancel_btn)
+        layout.addLayout(buttons)
+        cancel_btn.clicked.connect(dialog.reject)
+
+        def save_manual_record():
+            employee_id = employee_combo.currentData()
+            qt_time = arrival_edit.time()
+            result = self.db_helper.record_manual_check_in(
+                employee_id, datetime.combine(date.today(), time(qt_time.hour(), qt_time.minute(), qt_time.second()))
+            )
+            if not result.get('ok'):
+                messages = {
+                    'already_checked_in': "Attendance has already been recorded for this employee today.",
+                    'unknown_employee': "The selected employee is no longer active.",
+                    'database_error': "Database error. Please check the application log and try again."
+                }
+                QMessageBox.warning(dialog, "Attendance Not Saved",
+                                    messages.get(result.get('reason'), "Attendance could not be saved."))
+                return
+            dialog.accept()
+            self.update_stats()
+            if hasattr(self, 'current_table') and self.current_table:
+                self.populate_table_data(self.current_table)
+            QMessageBox.information(
+                self, "Attendance Saved",
+                f"Manual attendance recorded for {employee_combo.currentText()}\\n"
+                f"Check-in: {result.get('time')}\\nStatus: {result.get('status', '').upper()}"
+            )
+
+        save_btn.clicked.connect(save_manual_record)
+        dialog.exec_()
 
     def open_monthly_payroll(self):
         dialog = MonthlyPayrollDialog(self.admin_dialog, self.db_helper)
