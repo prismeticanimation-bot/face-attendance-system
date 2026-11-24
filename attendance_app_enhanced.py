@@ -1598,7 +1598,7 @@ class AttendanceSystemGUI(QMainWindow):
                 border-radius: 8px;
             }}
         """)
-        self.stop_btn.clicked.connect(self.stop_recognition)
+        self.stop_btn.clicked.connect(lambda checked=False: self.stop_recognition())
 
         self.admin_btn = QPushButton("⚙ Admin Panel")
         self.admin_btn.setFont(QFont("Segoe UI", 11, QFont.Bold))
@@ -1746,6 +1746,9 @@ class AttendanceSystemGUI(QMainWindow):
         self.recognition_label.setStyleSheet(f"color: {SUCCESS_GREEN}; padding: 10px;")
 
     def stop_recognition(self, status_text="Camera Stopped"):
+        # QPushButton.clicked may pass a bool; never send it to QLabel.setText().
+        if isinstance(status_text, bool):
+            status_text = "Camera Stopped"
         if self.camera_thread:
             self.camera_thread.stop()
             self.camera_thread = None
